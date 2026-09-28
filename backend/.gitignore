@@ -1,0 +1,18 @@
+# Environment / secrets
+.env
+
+# Virtual environment
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Django
+db.sqlite3
+
+# Agent scratch workspace (recreated / mutated at runtime)
+workspace/__pycache__/
+workspace/.pytest_cache/
