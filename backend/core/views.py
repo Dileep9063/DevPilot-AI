@@ -28,8 +28,11 @@ def ai_chat(request):
 @permission_classes([IsAuthenticated])
 def agent_run(request):
     task = request.data.get("task")
+    repo_url = request.data.get("repo_url")
     if not task:
         return Response({"error": "task is required"}, status=400)
+    if not repo_url:
+        return Response({"error": "repo_url is required"}, status=400)
 
     supplied_thread_id = request.data.get("thread_id")
     try:
@@ -39,7 +42,7 @@ def agent_run(request):
             thread_id = agent_service.new_thread_id()
             agent_service.create_agent_run(request.user, thread_id, task)
 
-        result = agent_service.run_agent_task(task, thread_id)
+        result = agent_service.run_agent_task(task, thread_id, repo_url)
     except agent_service.ThreadOwnershipError as e:
         return Response({"error": str(e)}, status=403)
     except ValueError as e:
