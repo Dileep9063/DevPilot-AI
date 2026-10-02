@@ -177,3 +177,44 @@ it's already in `.gitignore`).
   wired to the new `/api/agent/run/` and `/api/agent/resume/`
   endpoints yet (out of scope here since you asked specifically for
   the backend).
+
+
+## Current project status
+
+The core portfolio MVP is implemented:
+
+- React frontend with authentication and agent controls
+- Django REST API with JWT authentication
+- LangGraph orchestration
+- Gemini as the primary LLM with Hugging Face fallback for transient provider failures
+- Tool calling for workspace inspection and controlled code changes
+- Human-in-the-loop approval before file writes
+- Real pytest execution after changes
+- Automatic failure detection and AI-assisted debug/fix flow
+- A second human approval checkpoint for AI-generated fixes
+- PostgreSQL LangGraph checkpoint persistence
+- Per-user agent thread ownership checks
+- Workspace path traversal protection
+- Automated Django tests for deterministic agent behavior and API validation
+
+The main engineering story is that DevPilot is not only a code generator. It follows an inspect -> propose -> approve -> modify -> test -> debug -> approve -> retry workflow, with persistent state and controlled tools.
+
+## Final local verification
+
+Because API credentials and the local PostgreSQL service are intentionally not stored in Git, run the following once on the development machine:
+
+```powershell
+cd C:\DevPilot-AI\backend
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python manage.py test
+python -c "import core.agent; print('agent imported successfully')"
+
+cd ..\frontend
+npm install
+npm run build
+```
+
+Then start PostgreSQL and Django and test one real task from the UI.
+
+`backend/.env.example` contains the required environment variable names. Never commit the real `.env` or API tokens.
