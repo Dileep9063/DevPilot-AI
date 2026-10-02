@@ -8,6 +8,7 @@ function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
+  const [repoUrl, setRepoUrl] = useState("");
   const [task, setTask] = useState("");
   const [response, setResponse] = useState(null);
 
@@ -161,7 +162,7 @@ function App() {
   };
 
   const runAgent = async () => {
-    if (!task.trim() || !accessToken) {
+    if (!repoUrl.trim() || !task.trim() || !accessToken) {
       return;
     }
 
@@ -177,6 +178,7 @@ function App() {
           Authorization: `Bearer ${accessToken}`,
         },
         body: JSON.stringify({
+          repo_url: repoUrl,
           task,
           ...(threadId ? { thread_id: threadId } : {}),
         }),
@@ -255,6 +257,7 @@ function App() {
     setAccessToken("");
     setRefreshToken("");
     setResponse(null);
+    setRepoUrl("");
     setTask("");
     setThreadId("");
     setApprovalRequired(false);
@@ -329,6 +332,15 @@ function App() {
 
       <h2>AI Software Engineering Agent</h2>
 
+      <input
+        value={repoUrl}
+        onChange={(e) => setRepoUrl(e.target.value)}
+        placeholder="GitHub Repository URL (example: https://github.com/owner/repository)"
+        style={{ width: "600px", marginBottom: "10px" }}
+      />
+
+      <br />
+
       <textarea
         value={task}
         onChange={(e) => setTask(e.target.value)}
@@ -339,7 +351,10 @@ function App() {
 
       <br />
 
-      <button onClick={runAgent} disabled={loading || !task.trim()}>
+      <button
+        onClick={runAgent}
+        disabled={loading || !repoUrl.trim() || !task.trim()}
+      >
         {loading ? "Agent working..." : "Run Agent"}
       </button>
 
