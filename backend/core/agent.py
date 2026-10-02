@@ -877,7 +877,8 @@ graph_builder.add_conditional_edges(
     should_continue,
     {
         "tools": "tools",
-        "approval": "approval"
+        "approval": "approval",
+        "agent": "agent"
     }
 )
 
