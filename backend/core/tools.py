@@ -1,17 +1,39 @@
 from pathlib import Path
+import contextvars
 import difflib
 from langchain_core.tools import tool
 import os
 import subprocess
 import sys
-WORKSPACE = Path("workspace")
+
+DEFAULT_WORKSPACE = Path("workspace")
+_workspace_context = contextvars.ContextVar(
+    "devpilot_workspace",
+    default=DEFAULT_WORKSPACE,
+)
+
+def set_workspace(path):
+    """Set the workspace used by tools for the current agent invocation."""
+    return _workspace_context.set(Path(path))
+
+def reset_workspace(token):
+    """Restore the previous workspace context."""
+    _workspace_context.reset(token)
+
+def get_workspace():
+    """Return the workspace for the current agent invocation."""
+    return _workspace_context.get()
+
+# Backward-compatible name used by tests and existing code.
+WORKSPACE = DEFAULT_WORKSPACE
 def safe_workspace_path(path: str):
     """
     Resolve a path and ensure it stays inside the workspace.
     """
 
-    workspace_root = WORKSPACE.resolve()
-    target_path = (WORKSPACE / path).resolve()
+    workspace = get_workspace()
+    workspace_root = workspace.resolve()
+    target_path = (workspace / path).resolve()
 
     try:
         target_path.relative_to(workspace_root)
@@ -28,12 +50,14 @@ def search_code(query: str):
 
     results = []
 
-    if not WORKSPACE.exists():
+    workspace = get_workspace()
+
+    if not workspace.exists():
         return {
             "error": "Workspace directory does not exist."
         }
 
-    for file_path in WORKSPACE.rglob("*"):
+    for file_path in workspace.rglob("*"):
 
         if not file_path.is_file():
             continue
@@ -45,7 +69,7 @@ def search_code(query: str):
             )
 
             if query.lower() in content.lower():
-                results.append(str(file_path))
+                results.append(str(file_path.relative_to(workspace)))
 
         except Exception:
             continue
@@ -119,7 +143,7 @@ def list_dir(path: str = "."):
 
     for item in directory.rglob("*"):
 
-        relative_path = item.relative_to(WORKSPACE)
+        relative_path = item.relative_to(get_workspace())
 
         if item.is_dir():
             results.append(f"{relative_path}/")
@@ -240,7 +264,9 @@ def run_tests():
     Run the Python test suite inside the workspace.
     """
 
-    if not WORKSPACE.exists():
+    workspace = get_workspace()
+
+    if not workspace.exists():
         return {
             "status": "error",
             "message": "Workspace directory does not exist."
@@ -255,13 +281,13 @@ def run_tests():
     # write -> test can happen multiple times within the same second.
     import shutil as _shutil
 
-    for cache_dir in WORKSPACE.rglob("__pycache__"):
+    for cache_dir in get_workspace().rglob("__pycache__"):
         _shutil.rmtree(cache_dir, ignore_errors=True)
 
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-p", "no:cacheprovider"],
-            cwd=WORKSPACE,
+            cwd=get_workspace(),
             capture_output=True,
             text=True,
             timeout=60,
