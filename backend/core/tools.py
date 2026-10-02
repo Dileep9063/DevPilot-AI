@@ -42,42 +42,46 @@ def safe_workspace_path(path: str):
 
     return target_path
 
+IGNORED_DIRECTORIES = {
+    ".git", "node_modules", "dist", "build", "__pycache__",
+    ".venv", "venv", "coverage", ".next", ".cache", ".pytest_cache"
+}
+
+SEARCHABLE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".html",
+    ".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".env.example"
+}
+
+def _iter_source_files(root):
+    """Yield relevant source/config files while skipping generated/dependency trees."""
+    for current_root, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRECTORIES]
+        for filename in files:
+            path = Path(current_root) / filename
+            if path.suffix.lower() in SEARCHABLE_EXTENSIONS or filename in {"Dockerfile", "Makefile"}:
+                yield path
+
 @tool
 def search_code(query: str):
-    """
-    Search the workspace for a text string.
-    """
+    """Search relevant source/config files while ignoring dependencies and generated files."""
+    workspace = get_workspace()
+    if not workspace.exists():
+        return {"error": "Workspace directory does not exist."}
+
+    query = query.strip()
+    if not query:
+        return {"error": "Search query cannot be empty."}
 
     results = []
-
-    workspace = get_workspace()
-
-    if not workspace.exists():
-        return {
-            "error": "Workspace directory does not exist."
-        }
-
-    for file_path in workspace.rglob("*"):
-
-        if not file_path.is_file():
-            continue
-
+    for file_path in _iter_source_files(workspace):
         try:
-            content = file_path.read_text(
-                encoding="utf-8",
-                errors="ignore"
-            )
-
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
             if query.lower() in content.lower():
                 results.append(str(file_path.relative_to(workspace)))
-
         except Exception:
             continue
 
-    return {
-        "query": query,
-        "matches": results
-    }
+    return {"query": query, "matches": results}
 @tool
 def read_file(path: str):
     """
@@ -140,14 +144,20 @@ def list_dir(path: str = "."):
         }
 
     results = []
+    workspace = get_workspace()
 
-    for item in directory.rglob("*"):
+    # Recursively list only relevant project files/directories. Dependency,
+    # VCS, cache, and generated trees are intentionally hidden from the agent.
+    for current_root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRECTORIES]
+        current_path = Path(current_root)
 
-        relative_path = item.relative_to(get_workspace())
+        if current_path != directory:
+            results.append(f"{current_path.relative_to(workspace)}/")
 
-        if item.is_dir():
-            results.append(f"{relative_path}/")
-        else:
+        for filename in files:
+            file_path = current_path / filename
+            relative_path = file_path.relative_to(workspace)
             results.append(str(relative_path))
 
     return {
