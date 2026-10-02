@@ -80,8 +80,50 @@ hf_llm = ChatHuggingFace(
     )
 )
 
+
 # ============================================================
-# 3. SYSTEM PROMPT
+# 3. LLM FALLBACK
+# ============================================================
+
+def is_transient_provider_error(exc: Exception) -> bool:
+    """Return True for provider availability/rate-limit errors."""
+
+    message = str(exc).lower()
+
+    transient_markers = (
+        "429",
+        "rate limit",
+        "too many requests",
+        "503",
+        "service unavailable",
+        "unavailable",
+        "temporarily unavailable",
+        "high demand",
+    )
+
+    return any(marker in message for marker in transient_markers)
+
+
+def invoke_llm(messages, tools=None):
+    """
+    Invoke Gemini first and automatically fall back to Hugging Face
+    for transient provider availability/rate-limit failures.
+    """
+
+    primary = gemini_llm.bind_tools(tools) if tools else gemini_llm
+
+    try:
+        return primary.invoke(messages)
+    except Exception as exc:
+        if not is_transient_provider_error(exc):
+            raise
+
+        fallback = hf_llm.bind_tools(tools) if tools else hf_llm
+        return fallback.invoke(messages)
+
+
+# ============================================================
+# 4. SYSTEM PROMPT
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -126,20 +168,21 @@ Important rules:
 
 def agent_node(state: AgentState):
 
-    llm_with_tools = llm.bind_tools([
-        search_code,
-        read_file,
-        list_dir,
-        propose_file_change,
-        git_diff
-    ])
-
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         *state["messages"]
     ]
 
-    response = llm_with_tools.invoke(messages)
+    response = invoke_llm(
+        messages,
+        tools=[
+            search_code,
+            read_file,
+            list_dir,
+            propose_file_change,
+            git_diff
+        ]
+    )
 
     return {
         "messages": [response]
@@ -482,7 +525,7 @@ Important rules:
 Be concise and technically specific.
 """
 
-    response = llm.invoke(prompt)
+    response = invoke_llm(prompt)
 
     content = response.content
 
@@ -632,7 +675,7 @@ CODE:
 <complete proposed file content>
 """
 
-    response = llm.invoke(prompt)
+    response = invoke_llm(prompt)
 
     content = response.content
 
