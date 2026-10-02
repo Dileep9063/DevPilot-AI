@@ -64,6 +64,8 @@ class AgentState(TypedDict):
 
     failed_file: str
 
+    workspace_path: str
+
 
 # ============================================================
 # 2. LLM
