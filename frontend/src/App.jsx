@@ -20,6 +20,9 @@ function App() {
   const [approvalRequired, setApprovalRequired] = useState(false);
   const [proposedPath, setProposedPath] = useState("");
   const [proposedContent, setProposedContent] = useState("");
+  const [refreshToken, setRefreshToken] = useState(
+    () => localStorage.getItem("devpilot_refresh_token") || ""
+  );
 
   const authenticate = async () => {
     setLoading(true);
@@ -108,6 +111,54 @@ function App() {
     setProposedContent("");
   };
 
+  const refreshAccessToken = async () => {
+    if (!refreshToken) return false;
+
+    const refreshResponse = await fetch(
+      `${API_URL}/api/auth/refresh/`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh: refreshToken }),
+      }
+    );
+
+    if (!refreshResponse.ok) {
+      logout();
+      return false;
+    }
+
+    const data = await refreshResponse.json();
+    localStorage.setItem("devpilot_access_token", data.access);
+    setAccessToken(data.access);
+    return true;
+  };
+
+  const authenticatedFetch = async (url, options = {}) => {
+    let result = await fetch(url, {
+      ...options,
+      headers: {
+        ...(options.headers || {}),
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (result.status === 401 && refreshToken) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) {
+        result = await fetch(url, {
+          ...options,
+          headers: {
+            ...(options.headers || {}),
+            Authorization: `Bearer ${localStorage.getItem("devpilot_access_token")}`,
+          },
+        });
+      }
+    }
+
+    return result;
+  };
+
   const runAgent = async () => {
     if (!task.trim() || !accessToken) {
       return;
@@ -118,7 +169,7 @@ function App() {
     setApprovalRequired(false);
 
     try {
-      const agentResponse = await fetch(`${API_URL}/api/agent/run/`, {
+      const agentResponse = await authenticatedFetch(`${API_URL}/api/agent/run/`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -162,7 +213,7 @@ function App() {
     setResponse(null);
 
     try {
-      const resumeResponse = await fetch(
+      const resumeResponse = await authenticatedFetch(
         `${API_URL}/api/agent/resume/`,
         {
           method: "POST",
