@@ -73,6 +73,7 @@ function App() {
       localStorage.setItem("devpilot_refresh_token", loginData.refresh);
 
       setAccessToken(loginData.access);
+      setRefreshToken(loginData.refresh);
       setResponse({
         status: "success",
         message: "Authentication successful.",
@@ -252,6 +253,7 @@ function App() {
     localStorage.removeItem("devpilot_refresh_token");
 
     setAccessToken("");
+    setRefreshToken("");
     setResponse(null);
     setTask("");
     setThreadId("");
