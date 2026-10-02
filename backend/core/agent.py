@@ -33,7 +33,9 @@ from core.tools import (
     propose_file_change,
     git_diff,
     write_file,
-    run_tests
+    run_tests,
+    set_workspace,
+    reset_workspace
 )
 
 
@@ -167,8 +169,9 @@ Important rules:
 # ============================================================
 
 def agent_node(state: AgentState):
-
-    messages = [
+    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
+    try:
+        messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         *state["messages"]
     ]
@@ -184,9 +187,11 @@ def agent_node(state: AgentState):
         ]
     )
 
-    return {
-        "messages": [response]
-    }
+        return {
+            "messages": [response]
+        }
+    finally:
+        reset_workspace(workspace_token)
 
 
 # ============================================================
@@ -321,22 +326,26 @@ def route_after_approval(state: AgentState):
 
 def write_node(state: AgentState):
 
-    result = write_file.invoke({
+    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
+    try:
+        result = write_file.invoke({
         "path": state["proposed_path"],
         "content": state["proposed_content"]
     })
 
-    return {
-        "final_result": str(result),
+        return {
+            "final_result": str(result),
 
-        # Reset the consumed approval decision. Without this, a
+            # Reset the consumed approval decision. Without this, a
         # second approval checkpoint later in the SAME run (e.g. the
         # AI-fix proposal after a failed test) would hit the "already
         # decided" branch in approval_node with the OLD decision and
         # skip asking a human again — silently auto-approving the
         # AI's fix.
-        "approval": ""
-    }
+            "approval": ""
+        }
+    finally:
+        reset_workspace(workspace_token)
 
 
 # ============================================================
@@ -344,12 +353,15 @@ def write_node(state: AgentState):
 # ============================================================
 
 def test_node(state: AgentState):
+    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
+    try:
+        result = run_tests.invoke({})
 
-    result = run_tests.invoke({})
-
-    return {
-        "test_result": str(result)
-    }
+        return {
+            "test_result": str(result)
+        }
+    finally:
+        reset_workspace(workspace_token)
 
 
 # ============================================================
@@ -441,7 +453,7 @@ def ai_debug_node(state: AgentState):
         try:
 
             result = read_file.invoke({
-                "path": f"workspace/{failed_file}"
+                "path": failed_file
             })
 
             if isinstance(result, dict):
@@ -468,7 +480,7 @@ def ai_debug_node(state: AgentState):
     try:
 
         result = read_file.invoke({
-            "path": "workspace/auth.py"
+            "path": "auth.py"
         })
 
         if isinstance(result, dict):
