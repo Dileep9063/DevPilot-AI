@@ -4,8 +4,8 @@ Automated tests for DevPilot AI.
 These replace the one-off manual scripts that used to live scattered
 across backend/ and backend/core/ (test_ai_debug.py, hitl_test.py,
 test_debug_pipeline.py, etc). Those scripts were useful during
-development but called Gemini for real, printed to stdout, and had to
-be run and read by hand.
+development but called Gemini for real, printed to stdout, and had to be
+run and read by hand.
 
 Here we test the same logic in a repeatable, offline way:
   - The deterministic graph nodes/routing (no LLM calls involved).
@@ -14,14 +14,20 @@ Here we test the same logic in a repeatable, offline way:
 
 Anything that requires a real Gemini call (the LLM-driven nodes, or a
 full agent_run against a live model) is intentionally left for manual
-end-to-end testing with a real GEMINI_API_KEY — see the project
-README for that checklist.
+end-to-end testing with a real GEMINI_API_KEY — see the project README
+for that checklist.
 """
+
+import uuid
+
+from django.contrib.auth.models import User
+from django.test import TestCase
 
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END
 from rest_framework.test import APIClient
-from django.test import TestCase
+
+from .models import AgentRun
 
 from core.agent import (
     extract_proposal_node,
@@ -30,6 +36,7 @@ from core.agent import (
     route_after_debug_fix,
     write_node,
 )
+
 from core.tools import (
     WORKSPACE,
     write_file,
@@ -54,10 +61,17 @@ class AgentGraphUnitTests(TestCase):
         result = extract_proposal_node({"messages": [message]})
 
         self.assertEqual(result["proposed_path"], "auth.py")
-        self.assertIn("def login", result["proposed_content"])
+        self.assertIn(
+            "def login",
+            result["proposed_content"],
+        )
 
     def test_extract_proposal_ignores_non_dict_content(self):
-        message = ToolMessage(content="not a dict", tool_call_id="1")
+        message = ToolMessage(
+            content="not a dict",
+            thread_id=uuid.uuid4(),
+            tool_call_id="1",
+        )
 
         result = extract_proposal_node({"messages": [message]})
 
@@ -70,34 +84,67 @@ class AgentGraphUnitTests(TestCase):
 
         result = debug_node(state)
 
-        self.assertEqual(result["failed_file"], "test_auth.py")
-        self.assertIn("failure_detected", result["debug_result"])
+        self.assertEqual(
+            result["failed_file"],
+            "test_auth.py",
+        )
+
+        self.assertIn(
+            "failure_detected",
+            result["debug_result"],
+        )
 
     def test_debug_node_no_failure(self):
-        result = debug_node({"test_result": "1 passed in 0.05s"})
+        result = debug_node({
+            "test_result": "1 passed in 0.05s"
+        })
 
-        self.assertEqual(result["failed_file"], "")
-        self.assertEqual(result["debug_result"], "No test failure detected.")
+        self.assertEqual(
+            result["failed_file"],
+            "",
+        )
+
+        self.assertEqual(
+            result["debug_result"],
+            "No test failure detected.",
+        )
 
     def test_route_after_test(self):
         self.assertEqual(
-            route_after_test({"test_result": "{'status': 'passed'}"}),
+            route_after_test({
+                "test_result": "{'status': 'passed'}"
+            }),
             "done",
         )
+
         self.assertEqual(
-            route_after_test({"test_result": "{'status': 'failed'}"}),
+            route_after_test({
+                "test_result": "{'status': 'failed'}"
+            }),
             "debug",
         )
 
     def test_route_after_debug_fix_with_proposal(self):
-        state = {"proposed_path": "auth.py", "proposed_content": "code"}
+        state = {
+            "proposed_path": "auth.py",
+            "proposed_content": "code",
+        }
 
-        self.assertEqual(route_after_debug_fix(state), "approval")
+        self.assertEqual(
+            route_after_debug_fix(state),
+            "approval",
+        )
 
     def test_route_after_debug_fix_without_proposal(self):
-        state = {"proposed_path": "", "proposed_content": ""}
+        state = {
+            "proposed_path": "",
+            "proposed_content": "",
+        }
 
-        self.assertEqual(route_after_debug_fix(state), END)
+        self.assertEqual(
+            route_after_debug_fix(state),
+            END,
+        )
 
     def test_write_node_resets_approval_for_next_hitl_checkpoint(self):
         """
@@ -119,10 +166,15 @@ class AgentGraphUnitTests(TestCase):
 
             result = write_node(state)
 
-            self.assertEqual(result["approval"], "")
+            self.assertEqual(
+                result["approval"],
+                "",
+            )
 
         finally:
-            (WORKSPACE / test_path).unlink(missing_ok=True)
+            (WORKSPACE / test_path).unlink(
+                missing_ok=True
+            )
 
 
 class ToolsTests(TestCase):
@@ -137,16 +189,24 @@ class ToolsTests(TestCase):
                 "content": "print('hi')",
             })
 
-            self.assertEqual(write_result["status"], "success")
+            self.assertEqual(
+                write_result["status"],
+                "success",
+            )
 
             read_result = read_file.invoke({
                 "path": str(WORKSPACE / test_path),
             })
 
-            self.assertEqual(read_result["content"], "print('hi')")
+            self.assertEqual(
+                read_result["content"],
+                "print('hi')",
+            )
 
         finally:
-            (WORKSPACE / test_path).unlink(missing_ok=True)
+            (WORKSPACE / test_path).unlink(
+                missing_ok=True
+            )
 
     def test_propose_file_change_blocks_path_traversal(self):
         result = propose_file_change.invoke({
@@ -154,7 +214,10 @@ class ToolsTests(TestCase):
             "content": "x = 1",
         })
 
-        self.assertEqual(result["status"], "error")
+        self.assertEqual(
+            result["status"],
+            "error",
+        )
 
     def test_propose_file_change_returns_pending_approval(self):
         result = propose_file_change.invoke({
@@ -162,8 +225,15 @@ class ToolsTests(TestCase):
             "content": "x = 1",
         })
 
-        self.assertEqual(result["status"], "pending_approval")
-        self.assertEqual(result["path"], "auth.py")
+        self.assertEqual(
+            result["status"],
+            "pending_approval",
+        )
+
+        self.assertEqual(
+            result["path"],
+            "auth.py",
+        )
 
 
 class AgentApiValidationTests(TestCase):
@@ -172,16 +242,42 @@ class AgentApiValidationTests(TestCase):
     def setUp(self):
         self.client = APIClient()
 
-    def test_status_endpoint(self):
-        response = self.client.get("/api/status/")
+        self.user = User.objects.create_user(
+            username="testuser",
+            email="test@example.com",
+            password="Testuser@123",
+        )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["status"], "success")
+        self.client.force_authenticate(
+            user=self.user
+        )
+
+    def test_status_endpoint(self):
+        response = self.client.get(
+            "/api/status/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertEqual(
+            response.data["status"],
+            "success",
+        )
 
     def test_agent_run_requires_task(self):
-        response = self.client.post("/api/agent/run/", {}, format="json")
+        response = self.client.post(
+            "/api/agent/run/",
+            {},
+            format="json",
+        )
 
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.status_code,
+            400,
+        )
 
     def test_agent_resume_requires_thread_id(self):
         response = self.client.post(
@@ -190,13 +286,168 @@ class AgentApiValidationTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.status_code,
+            400,
+        )
 
     def test_agent_resume_requires_valid_decision(self):
         response = self.client.post(
             "/api/agent/resume/",
-            {"thread_id": "abc", "decision": "maybe"},
+            {
+                "thread_id": "abc",
+                "decision": "maybe",
+            },
             format="json",
         )
 
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.status_code,
+            400,
+        )
+    def test_agent_run_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.post(
+            "/api/agent/run/",
+            {"task": "test"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+
+    def test_agent_resume_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.post(
+            "/api/agent/resume/",
+            {
+                "thread_id": str(uuid.uuid4()),
+                "decision": "approve",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+class AgentThreadOwnershipTests(TestCase):
+    """Authenticated users can only access their own agent threads."""
+
+    def setUp(self):
+        self.client = APIClient()
+
+        self.user_a = User.objects.create_user(
+            username="user_a",
+            email="usera@example.com",
+            password="Testuser@123",
+        )
+
+        self.user_b = User.objects.create_user(
+            username="user_b",
+            email="userb@example.com",
+            password="Testuser@123",
+        )
+
+        self.agent_run = AgentRun.objects.create(
+            user=self.user_a,
+            thread_id=uuid.uuid4(),
+            task="Test agent task",
+        )
+
+    def test_user_cannot_resume_another_users_thread(self):
+        self.client.force_authenticate(
+            user=self.user_b
+        )
+
+        response = self.client.post(
+            "/api/agent/resume/",
+            {
+                "thread_id": str(self.agent_run.thread_id),
+                "decision": "approve",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            403,
+        )
+
+    def test_user_cannot_run_using_another_users_thread(self):
+        self.client.force_authenticate(
+            user=self.user_b
+        )
+
+        response = self.client.post(
+            "/api/agent/run/",
+            {
+                "task": "Try to access another user's thread",
+                "thread_id": str(self.agent_run.thread_id),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            403,
+        )
+class JWTAuthenticationTests(TestCase):
+    """Test JWT login and token refresh behavior."""
+
+    def setUp(self):
+        self.client = APIClient()
+
+        self.user = User.objects.create_user(
+            username="jwt_user",
+            email="jwt@example.com",
+            password="Testuser@123",
+        )
+
+    def test_login_returns_access_and_refresh_tokens(self):
+        response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "jwt_user",
+                "password": "Testuser@123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        self.assertIn("refresh", response.data)
+
+    def test_refresh_returns_new_access_token(self):
+        login_response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "jwt_user",
+                "password": "Testuser@123",
+            },
+            format="json",
+        )
+
+        refresh_token = login_response.data["refresh"]
+
+        response = self.client.post(
+            "/api/auth/refresh/",
+            {
+                "refresh": refresh_token,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+    def test_login_rejects_invalid_password(self):
+        response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "jwt_user",
+                "password": "WrongPassword123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)

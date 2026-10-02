@@ -1,5 +1,5 @@
 import os
-
+import atexit
 os.environ.setdefault(
     "DJANGO_SETTINGS_MODULE",
     "config.settings"
@@ -17,8 +17,9 @@ from langchain_core.messages import (
 )
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-
-from langgraph.checkpoint.memory import InMemorySaver
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg_pool import ConnectionPool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -66,10 +67,18 @@ class AgentState(TypedDict):
 # 2. LLM
 # ============================================================
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash"
+gemini_llm = ChatGoogleGenerativeAI(
+    model="gemini-3.8-flash"
 )
 
+hf_llm = ChatHuggingFace(
+    llm=HuggingFaceEndpoint(
+        repo_id="openai/gpt-oss-120b",
+        task="text-generation",
+        huggingfacehub_api_token=os.environ["HF_TOKEN"],
+        max_new_tokens=1000,
+    )
+)
 
 # ============================================================
 # 3. SYSTEM PROMPT
@@ -898,8 +907,34 @@ graph_builder.add_conditional_edges(
 # 30. CHECKPOINTER
 # ============================================================
 
-checkpointer = InMemorySaver()
+# ============================================================
+# 30. CHECKPOINTER
+# ============================================================
 
+def create_checkpointer():
+    """
+    Create a persistent PostgreSQL-backed LangGraph checkpoint store.
+    """
+
+    uri = os.environ["LANGGRAPH_POSTGRES_URI"]
+
+    pool = ConnectionPool(
+        conninfo=uri,
+        min_size=1,
+        max_size=5,
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+        },
+    )
+
+    checkpointer = PostgresSaver(pool)
+
+    return pool, checkpointer
+
+
+checkpoint_pool, checkpointer = create_checkpointer()
+atexit.register(checkpoint_pool.close)
 
 # ============================================================
 # 31. COMPILE GRAPH

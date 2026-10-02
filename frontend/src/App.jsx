@@ -7,62 +7,190 @@ function App() {
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [message, setMessage] = useState("");
-  const [response, setResponse] = useState("");
+
+  const [task, setTask] = useState("");
+  const [response, setResponse] = useState(null);
+
   const [loading, setLoading] = useState(false);
-  const [accessToken, setAccessToken] = useState(() => localStorage.getItem("devpilot_access_token") || "");
+  const [accessToken, setAccessToken] = useState(
+    () => localStorage.getItem("devpilot_access_token") || ""
+  );
+
+  const [threadId, setThreadId] = useState("");
+  const [approvalRequired, setApprovalRequired] = useState(false);
+  const [proposedPath, setProposedPath] = useState("");
+  const [proposedContent, setProposedContent] = useState("");
 
   const authenticate = async () => {
     setLoading(true);
-    setResponse("");
+    setResponse(null);
+
     try {
       if (mode === "register") {
-        const r = await fetch(`${API_URL}/api/auth/register/`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, email, password }),
-        });
-        const data = await r.json();
-        if (!r.ok) throw new Error(JSON.stringify(data));
+        const registerResponse = await fetch(
+          `${API_URL}/api/auth/register/`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              username,
+              email,
+              password,
+            }),
+          }
+        );
+
+        const registerData = await registerResponse.json();
+
+        if (!registerResponse.ok) {
+          throw new Error(JSON.stringify(registerData));
+        }
       }
 
-      const r = await fetch(`${API_URL}/api/auth/login/`, {
+      const loginResponse = await fetch(`${API_URL}/api/auth/login/`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          username,
+          password,
+        }),
       });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.detail || "Login failed");
 
-      localStorage.setItem("devpilot_access_token", data.access);
-      localStorage.setItem("devpilot_refresh_token", data.refresh);
-      setAccessToken(data.access);
-      setResponse("Authentication successful.");
+      const loginData = await loginResponse.json();
+
+      if (!loginResponse.ok) {
+        throw new Error(loginData.detail || "Login failed");
+      }
+
+      localStorage.setItem("devpilot_access_token", loginData.access);
+      localStorage.setItem("devpilot_refresh_token", loginData.refresh);
+
+      setAccessToken(loginData.access);
+      setResponse({
+        status: "success",
+        message: "Authentication successful.",
+      });
     } catch (error) {
-      setResponse(`Error: ${error.message}`);
+      setResponse({
+        status: "error",
+        error: error.message,
+      });
     } finally {
       setLoading(false);
     }
   };
 
-  const sendMessage = async () => {
-    if (!message.trim() || !accessToken) return;
+  const handleAgentResult = (data) => {
+    setResponse(data);
+
+    if (data.status === "waiting_for_approval") {
+      setApprovalRequired(true);
+
+      const approval = data.approval_request || {};
+
+      setProposedPath(
+        approval.path || approval.proposed_path || ""
+      );
+
+      setProposedContent(
+        approval.content || approval.proposed_content || ""
+      );
+
+      return;
+    }
+
+    setApprovalRequired(false);
+    setProposedPath("");
+    setProposedContent("");
+  };
+
+  const runAgent = async () => {
+    if (!task.trim() || !accessToken) {
+      return;
+    }
+
     setLoading(true);
-    setResponse("");
+    setResponse(null);
+    setApprovalRequired(false);
+
     try {
-      const r = await fetch(`${API_URL}/api/ai/chat/`, {
+      const agentResponse = await fetch(`${API_URL}/api/agent/run/`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${accessToken}`,
         },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({
+          task,
+          ...(threadId ? { thread_id: threadId } : {}),
+        }),
       });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.detail || data.error || "Something went wrong");
-      setResponse(data.response);
+
+      const data = await agentResponse.json();
+
+      if (!agentResponse.ok) {
+        throw new Error(
+          data.detail || data.error || "Agent request failed"
+        );
+      }
+
+      if (data.thread_id) {
+        setThreadId(data.thread_id);
+      }
+
+      handleAgentResult(data);
     } catch (error) {
-      setResponse(`Error: ${error.message}`);
+      setResponse({
+        status: "error",
+        error: error.message,
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const resumeAgent = async (decision) => {
+    if (!threadId || !accessToken) {
+      return;
+    }
+
+    setLoading(true);
+    setResponse(null);
+
+    try {
+      const resumeResponse = await fetch(
+        `${API_URL}/api/agent/resume/`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({
+            thread_id: threadId,
+            decision,
+          }),
+        }
+      );
+
+      const data = await resumeResponse.json();
+
+      if (!resumeResponse.ok) {
+        throw new Error(
+          data.detail || data.error || "Agent resume failed"
+        );
+      }
+
+      handleAgentResult(data);
+    } catch (error) {
+      setResponse({
+        status: "error",
+        error: error.message,
+      });
     } finally {
       setLoading(false);
     }
@@ -71,27 +199,71 @@ function App() {
   const logout = () => {
     localStorage.removeItem("devpilot_access_token");
     localStorage.removeItem("devpilot_refresh_token");
+
     setAccessToken("");
-    setResponse("");
+    setResponse(null);
+    setTask("");
+    setThreadId("");
+    setApprovalRequired(false);
+    setProposedPath("");
+    setProposedContent("");
   };
 
   if (!accessToken) {
     return (
       <div>
         <h1>DevPilot AI</h1>
-        <h2>{mode === "login" ? "Login" : "Create account"}</h2>
+
+        <h2>
+          {mode === "login" ? "Login" : "Create account"}
+        </h2>
+
         {mode === "register" && (
-          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" type="email" />
+          <input
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="Email"
+            type="email"
+          />
         )}
-        <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="Username" />
-        <input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" type="password" />
+
+        <input
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          placeholder="Username"
+        />
+
+        <input
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="Password"
+          type="password"
+        />
+
         <button onClick={authenticate} disabled={loading}>
-          {loading ? "Please wait..." : mode === "login" ? "Login" : "Register"}
+          {loading
+            ? "Please wait..."
+            : mode === "login"
+            ? "Login"
+            : "Register"}
         </button>
-        <button onClick={() => setMode(mode === "login" ? "register" : "login")} disabled={loading}>
-          {mode === "login" ? "Create account" : "Back to login"}
+
+        <button
+          onClick={() =>
+            setMode(mode === "login" ? "register" : "login")
+          }
+          disabled={loading}
+        >
+          {mode === "login"
+            ? "Create account"
+            : "Back to login"}
         </button>
-        <p>{response}</p>
+
+        {response && (
+          <pre>
+            {JSON.stringify(response, null, 2)}
+          </pre>
+        )}
       </div>
     );
   }
@@ -99,15 +271,86 @@ function App() {
   return (
     <div>
       <h1>DevPilot AI</h1>
+
       <button onClick={logout}>Logout</button>
-      <input value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Enter your task..." />
-      <button onClick={sendMessage} disabled={loading}>
-        {loading ? "Thinking..." : "Ask AI"}
+
+      <h2>AI Software Engineering Agent</h2>
+
+      <textarea
+        value={task}
+        onChange={(e) => setTask(e.target.value)}
+        placeholder="Example: Add a logout function to workspace/auth.py"
+        rows={6}
+        cols={70}
+      />
+
+      <br />
+
+      <button onClick={runAgent} disabled={loading || !task.trim()}>
+        {loading ? "Agent working..." : "Run Agent"}
       </button>
-      <div>
-        <h2>AI Response</h2>
-        <p>{response}</p>
-      </div>
+
+      {threadId && (
+        <p>
+          <strong>Thread ID:</strong> {threadId}
+        </p>
+      )}
+
+      {approvalRequired && (
+        <div>
+          <h2>Human Approval Required</h2>
+
+          <p>
+            The agent wants to modify the following file:
+          </p>
+
+          <p>
+            <strong>{proposedPath || "Unknown file"}</strong>
+          </p>
+
+          {proposedContent && (
+            <pre
+              style={{
+                whiteSpace: "pre-wrap",
+                border: "1px solid #ccc",
+                padding: "10px",
+              }}
+            >
+              {proposedContent}
+            </pre>
+          )}
+
+          <button
+            onClick={() => resumeAgent("approve")}
+            disabled={loading}
+          >
+            Approve
+          </button>
+
+          <button
+            onClick={() => resumeAgent("reject")}
+            disabled={loading}
+          >
+            Reject
+          </button>
+        </div>
+      )}
+
+      {response && (
+        <div>
+          <h2>Agent Response</h2>
+
+          <pre
+            style={{
+              whiteSpace: "pre-wrap",
+              border: "1px solid #ccc",
+              padding: "10px",
+            }}
+          >
+            {JSON.stringify(response, null, 2)}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }
