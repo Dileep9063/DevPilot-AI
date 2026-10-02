@@ -288,9 +288,9 @@ def run_tests():
             scripts = package.get("scripts", {})
 
             if "test" in scripts:
-                command = ["npm", "test"]
+                command = ["npm.cmd", "test"]
             elif "build" in scripts:
-                command = ["npm", "run", "build"]
+                command = ["npm.cmd", "run", "build"]
             else:
                 return {
                     "status": "error",
