@@ -172,24 +172,20 @@ def agent_node(state: AgentState):
     workspace_token = set_workspace(state.get("workspace_path", "workspace"))
     try:
         messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        *state["messages"]
-    ]
-
-    response = invoke_llm(
-        messages,
-        tools=[
-            search_code,
-            read_file,
-            list_dir,
-            propose_file_change,
-            git_diff
+            SystemMessage(content=SYSTEM_PROMPT),
+            *state["messages"],
         ]
-    )
-
-        return {
-            "messages": [response]
-        }
+        response = invoke_llm(
+            messages,
+            tools=[
+                search_code,
+                read_file,
+                list_dir,
+                propose_file_change,
+                git_diff,
+            ],
+        )
+        return {"messages": [response]}
     finally:
         reset_workspace(workspace_token)
 
@@ -198,13 +194,20 @@ def agent_node(state: AgentState):
 # 5. TOOL NODE
 # ============================================================
 
-tool_node = ToolNode([
+tool_executor = ToolNode([
     search_code,
     read_file,
     list_dir,
     propose_file_change,
-    git_diff
+    git_diff,
 ])
+
+def tool_node(state: AgentState):
+    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
+    try:
+        return tool_executor.invoke(state)
+    finally:
+        reset_workspace(workspace_token)
 
 
 # ============================================================
