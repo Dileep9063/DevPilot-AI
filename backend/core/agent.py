@@ -217,12 +217,10 @@ def tool_node(state: AgentState):
 # ============================================================
 
 def route_after_tools(state: AgentState):
-
+    """Route proposal results to extraction; otherwise continue analysis."""
     last_message = state["messages"][-1]
-
     if last_message.name == "propose_file_change":
         return "extract_proposal"
-
     return "agent"
 
 
@@ -275,13 +273,16 @@ def extract_proposal_node(state: AgentState):
 # ============================================================
 
 def should_continue(state: AgentState):
-
+    """Only enter HITL when a valid proposal exists."""
     last_message = state["messages"][-1]
-
     if last_message.tool_calls:
         return "tools"
 
-    return "approval"
+    if state.get("proposed_path") and state.get("proposed_content"):
+        return "approval"
+
+    # The model must keep working until it produces a concrete proposal.
+    return "agent"
 
 
 # ============================================================
@@ -289,6 +290,9 @@ def should_continue(state: AgentState):
 # ============================================================
 
 def approval_node(state: AgentState):
+
+    if not state.get("proposed_path") or not isinstance(state.get("proposed_content"), str):
+        return {"approval": "reject"}
 
     # If this node is being resumed after HITL,
     # the approval value has already been supplied.
@@ -893,12 +897,21 @@ graph_builder.add_conditional_edges(
 
 
 # ============================================================
-# 23. EXTRACT PROPOSAL → APPROVAL
+# 23. EXTRACT PROPOSAL → APPROVAL / AGENT
 # ============================================================
 
-graph_builder.add_edge(
+def route_after_extract_proposal(state: AgentState):
+    if state.get("proposed_path") and isinstance(state.get("proposed_content"), str):
+        return "approval"
+    return "agent"
+
+graph_builder.add_conditional_edges(
     "extract_proposal",
-    "approval"
+    route_after_extract_proposal,
+    {
+        "approval": "approval",
+        "agent": "agent",
+    }
 )
 
 
