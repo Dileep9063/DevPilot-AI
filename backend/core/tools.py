@@ -261,57 +261,82 @@ def write_file(path: str, content: str):
 @tool
 def run_tests():
     """
-    Run the Python test suite inside the workspace.
+    Run the repository's test/build command inside the active workspace.
     """
-
     workspace = get_workspace()
 
     if not workspace.exists():
         return {
             "status": "error",
-            "message": "Workspace directory does not exist."
+            "message": "Workspace directory does not exist.",
         }
 
-    # Clear stale bytecode caches before every run. Without this, a
-    # file rewritten with different content but the same size can be
-    # served from a cached .pyc if the source mtime doesn't change at
-    # a coarser-than-expected resolution, making the retry loop see a
-    # PASS/FAIL result that doesn't match the actual current source.
-    # This matters a lot here because write -> test -> debug -> fix ->
-    # write -> test can happen multiple times within the same second.
     import shutil as _shutil
-
-    for cache_dir in get_workspace().rglob("__pycache__"):
+    for cache_dir in workspace.rglob("__pycache__"):
         _shutil.rmtree(cache_dir, ignore_errors=True)
 
     try:
+        if (workspace / "package.json").exists():
+            import json
+
+            package = json.loads(
+                (workspace / "package.json").read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+            )
+            scripts = package.get("scripts", {})
+
+            if "test" in scripts:
+                command = ["npm", "test"]
+            elif "build" in scripts:
+                command = ["npm", "run", "build"]
+            else:
+                return {
+                    "status": "error",
+                    "message": "package.json has no test or build script.",
+                }
+        elif (workspace / "pyproject.toml").exists() or (workspace / "pytest.ini").exists() or list(workspace.glob("test*.py")):
+            command = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider"]
+        else:
+            return {
+                "status": "error",
+                "message": "Could not detect a supported test/build command.",
+            }
+
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider"],
-            cwd=get_workspace(),
+            command,
+            cwd=workspace,
             capture_output=True,
             text=True,
-            timeout=60,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            timeout=120,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
 
         return {
             "status": "passed" if result.returncode == 0 else "failed",
             "exit_code": result.returncode,
+            "command": command,
             "stdout": result.stdout,
-            "stderr": result.stderr
+            "stderr": result.stderr,
         }
 
     except subprocess.TimeoutExpired:
         return {
             "status": "error",
-            "message": "Test execution timed out after 60 seconds."
+            "message": "Test/build execution timed out after 120 seconds.",
         }
-
+    except FileNotFoundError as e:
+        return {
+            "status": "error",
+            "message": f"Required command was not found: {e}",
+        }
     except Exception as e:
         return {
             "status": "error",
-            "message": str(e)
+            "message": str(e),
         }
+
 
 if __name__ == "__main__":
 
