@@ -60,7 +60,12 @@ def read_file(path: str):
     Read the contents of a file inside the workspace.
     """
 
-    file_path = Path(path)
+    file_path = safe_workspace_path(path)
+
+    if file_path is None:
+        return {
+            "error": "Access denied: path must stay inside the workspace."
+        }
 
     if not file_path.exists():
         return {
@@ -93,7 +98,12 @@ def list_dir(path: str = "."):
     List files and directories inside the workspace.
     """
 
-    directory = WORKSPACE / path
+    directory = safe_workspace_path(path)
+
+    if directory is None:
+        return {
+            "error": "Access denied: path must stay inside the workspace."
+        }
 
     if not directory.exists():
         return {
