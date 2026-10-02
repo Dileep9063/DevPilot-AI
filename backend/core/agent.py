@@ -253,9 +253,20 @@ def extract_proposal_node(state: AgentState):
     if result.get("status") != "pending_approval":
         return {}
 
+    proposed_path = str(result.get("path", "")).strip()
+    proposed_content = result.get("proposed_content", "")
+
+    # Never send an empty path to the approval/write stages.
+    if not proposed_path or not isinstance(proposed_content, str):
+        return {
+            "proposed_path": "",
+            "proposed_content": "",
+            "final_result": "Invalid file-change proposal: a non-empty file path is required."
+        }
+
     return {
-        "proposed_path": result["path"],
-        "proposed_content": result["proposed_content"]
+        "proposed_path": proposed_path,
+        "proposed_content": proposed_content
     }
 
 
