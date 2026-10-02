@@ -438,9 +438,8 @@ def debug_node(state: AgentState):
 # ============================================================
 
 def ai_debug_node(state: AgentState):
-    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
-    try:
-        debug_result = state["debug_result"]
+
+    debug_result = state["debug_result"]
     test_result = state["test_result"]
 
     # Get the failing file directly from deterministic state.
@@ -574,9 +573,8 @@ Be concise and technically specific.
 # ============================================================
 
 def prepare_debug_fix_node(state: AgentState):
-    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
-    try:
-        debug_result = state["debug_result"]
+
+    debug_result = state["debug_result"]
     test_result = state["test_result"]
 
     # Get the failing file directly from state.
