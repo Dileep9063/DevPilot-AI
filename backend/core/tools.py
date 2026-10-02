@@ -225,12 +225,24 @@ def write_file(path: str, content: str):
     Create or overwrite a file inside the workspace.
     """
 
+    if not path or not path.strip():
+        return {
+            "status": "error",
+            "message": "A valid relative file path is required."
+        }
+
     file_path = safe_workspace_path(path)
 
     if file_path is None:
         return {
             "status": "error",
             "message": "Access denied: path must stay inside the workspace."
+        }
+
+    if file_path.exists() and not file_path.is_file():
+        return {
+            "status": "error",
+            "message": "The provided path is not a file."
         }
 
     try:
