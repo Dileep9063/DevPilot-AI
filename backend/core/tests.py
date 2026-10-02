@@ -451,3 +451,11 @@ class JWTAuthenticationTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 401)
+
+class ProviderFallbackTests(TestCase):
+    def test_transient_provider_error_detection(self):
+        from core.agent import is_transient_provider_error
+
+        self.assertTrue(is_transient_provider_error(Exception("503 UNAVAILABLE")))
+        self.assertTrue(is_transient_provider_error(Exception("429 rate limit")))
+        self.assertFalse(is_transient_provider_error(Exception("invalid request")))
