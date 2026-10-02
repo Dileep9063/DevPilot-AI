@@ -195,7 +195,7 @@ class ToolsTests(TestCase):
             )
 
             read_result = read_file.invoke({
-                "path": str(WORKSPACE / test_path),
+                "path": test_path,
             })
 
             self.assertEqual(
