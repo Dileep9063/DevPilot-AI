@@ -1,26 +1,40 @@
 import os
 import atexit
+import ast
+import re
+
 os.environ.setdefault(
     "DJANGO_SETTINGS_MODULE",
     "config.settings"
 )
 
 import django
-django.setup()
 
+django.setup()
 
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import (
     AnyMessage,
-    SystemMessage
+    SystemMessage,
 )
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langchain_huggingface import (
+    ChatHuggingFace,
+    HuggingFaceEndpoint,
+)
+from langchain_openai import ChatOpenAI
+
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
-from langgraph.graph import StateGraph, START, END
+
+from langgraph.graph import (
+    StateGraph,
+    START,
+    END,
+)
+
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
@@ -31,49 +45,90 @@ from core.tools import (
     read_file,
     list_dir,
     propose_file_change,
+    propose_new_file,
     git_diff,
+    git_status,
+    create_agent_branch,
     write_file,
+    write_new_file,
     run_tests,
     set_workspace,
-    reset_workspace
+    reset_workspace,
 )
 
 
 # ============================================================
-# 1. AGENT STATE
+# 1. CONFIGURATION
+# ============================================================
+
+MAX_AGENT_STEPS = 15
+MAX_DEBUG_ATTEMPTS = 3
+
+
+# ============================================================
+# 2. AGENT STATE
 # ============================================================
 
 class AgentState(TypedDict):
 
+    # Run identity
+    thread_id: str
+
+    # Original user request
+    task: str
+
+    # Conversation/tool history
     messages: Annotated[
         list[AnyMessage],
         add_messages
     ]
 
+    # Human approval
     approval: str
 
+    # Current proposed file change
     proposed_path: str
-
     proposed_content: str
 
+    # Type of proposal
+    # "existing_file" or "new_file"
+    proposal_type: str
+
+    # Git branch operation
+    branch_result: str
+
+    # Test/debug information
     test_result: str
-
     debug_result: str
-
     final_result: str
 
+    # Failure information
     failed_file: str
 
+    # Workspace used by this run
     workspace_path: str
 
+    # Safety limits
+    agent_steps: int
+    debug_attempts: int
+
 
 # ============================================================
-# 2. LLM
+# 3. LLM PROVIDERS
 # ============================================================
+
+# Gemini
+#
+# Kept available for future provider switching/fallback.
 
 gemini_llm = ChatGoogleGenerativeAI(
     model="gemini-3.8-flash"
 )
+
+
+# Hugging Face
+#
+# Kept available for future provider switching/fallback.
 
 hf_llm = ChatHuggingFace(
     llm=HuggingFaceEndpoint(
@@ -85,12 +140,29 @@ hf_llm = ChatHuggingFace(
 )
 
 
+# OpenRouter
+
+openrouter_llm = ChatOpenAI(
+    model="openrouter/free",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+    base_url="https://openrouter.ai/api/v1",
+)
+
+
+# Current primary provider
+
+PRIMARY_LLM = openrouter_llm
+
+
 # ============================================================
-# 3. LLM FALLBACK
+# 4. PROVIDER ERROR DETECTION
 # ============================================================
 
 def is_transient_provider_error(exc: Exception) -> bool:
-    """Return True for provider availability/rate-limit errors."""
+    """
+    Return True when the provider appears temporarily unavailable,
+    rate-limited, or overloaded.
+    """
 
     message = str(exc).lower()
 
@@ -103,80 +175,498 @@ def is_transient_provider_error(exc: Exception) -> bool:
         "unavailable",
         "temporarily unavailable",
         "high demand",
+        "timeout",
     )
 
-    return any(marker in message for marker in transient_markers)
-
-
-def invoke_llm(messages, tools=None):
-    """
-    Invoke Gemini first and automatically fall back to Hugging Face
-    for transient provider availability/rate-limit failures.
-    """
-
-    primary = gemini_llm.bind_tools(tools) if tools else gemini_llm
-
-    try:
-        return primary.invoke(messages)
-    except Exception as exc:
-        if not is_transient_provider_error(exc):
-            raise
-
-        fallback = hf_llm.bind_tools(tools) if tools else hf_llm
-        return fallback.invoke(messages)
+    return any(
+        marker in message
+        for marker in transient_markers
+    )
 
 
 # ============================================================
-# 4. SYSTEM PROMPT
+# 5. LLM INVOCATION
+# ============================================================
+
+def invoke_llm(messages, tools=None):
+    """
+    Invoke the current primary LLM.
+
+    OpenRouter is currently used as the primary provider because
+    Gemini free-tier quota may be exhausted.
+
+    Provider fallback can be added later without changing the
+    LangGraph workflow.
+    """
+
+    llm = PRIMARY_LLM
+
+    if tools:
+        llm = llm.bind_tools(tools)
+
+    try:
+
+        return llm.invoke(messages)
+
+    except Exception as exc:
+
+        print(
+            "LLM ERROR:",
+            repr(exc)
+        )
+
+        raise
+
+
+# ============================================================
+# 6. SYSTEM PROMPT
 # ============================================================
 
 SYSTEM_PROMPT = """
 You are DevPilot AI, an AI software engineering agent.
 
-Your job is to understand software development tasks and
-work with the provided codebase tools.
+Your job is to understand the user's software-development task,
+inspect the provided repository, propose the smallest correct
+code change, obtain human approval, and then allow the system
+to apply the approved change.
 
-Available AI tools:
+============================================================
+AVAILABLE TOOLS
+============================================================
 
 1. list_dir
-   Use this to understand the project structure.
+
+Use this to understand the project structure.
+
+Use it when you need to determine:
+- framework
+- programming language
+- available files
+- tests
+- configuration
+- project structure
+
+Do not repeatedly list the same directory if nothing has changed.
+
+------------------------------------------------------------
 
 2. search_code
-   Use this to find relevant code or text.
+
+Use this to find relevant:
+- files
+- functions
+- classes
+- imports
+- routes
+- APIs
+- configuration
+- tests
+- documentation
+- symbols
+
+Use targeted searches.
+
+Do not repeatedly search the same term after the information
+has already been established.
+
+Do not perform random searches merely to find something to modify.
+
+------------------------------------------------------------
 
 3. read_file
-   Use this to inspect the contents of a specific file.
+
+Use this to inspect the exact contents of a relevant file.
+
+Always read an existing file before proposing a modification.
+
+------------------------------------------------------------
 
 4. propose_file_change
-   Use this when a code change is needed.
-   Never directly modify files.
 
-5. git_diff
-   Use this to inspect the exact proposed changes.
+Use this when an EXISTING file needs to be modified.
 
-Important rules:
+IMPORTANT:
 
-- Start by understanding the project structure when necessary.
-- Search for relevant code instead of making random searches.
-- Read relevant files before proposing modifications.
-- Do not repeatedly search for single letters or common characters.
-- Do not call a tool if the information you already have is sufficient.
-- Never directly modify files.
-- All file modifications require human approval.
+- First read the target file.
+- old_text must exactly match existing text.
+- new_text must contain only the replacement section.
+- Do not provide the entire file as old_text.
+- Do not provide a unified diff.
+- Do not directly modify files.
+- The tool only creates a proposal.
+- Human approval is required before writing.
+
+------------------------------------------------------------
+
+5. propose_new_file
+
+Use this when the requested change requires creating a NEW file.
+
+IMPORTANT:
+
+- First determine that the requested file does not already exist.
+- Use the repository's existing language/framework conventions.
+- Do not silently change the requested language.
+- Do not modify an unrelated existing file instead.
+- Provide the intended file path.
+- Provide the complete content of the new file.
+- Do not directly create the file.
+- The tool only creates a proposal.
+- Human approval is required before the file is created.
+
+Use propose_file_change for existing files.
+
+Use propose_new_file for new files.
+
+------------------------------------------------------------
+
+6. git_diff
+
+Use this to inspect proposed/current repository changes when useful.
+
+------------------------------------------------------------
+
+7. git_status
+
+Use this to inspect the current Git working-tree status.
+
+Do not modify the repository with git commands.
+
+============================================================
+TASK FIDELITY
+============================================================
+
+The user's request is the source of truth.
+
+Preserve the user's requested:
+
+- programming language
+- framework
+- file type
+- filename
+- feature
+- behavior
+- scope
+
+NEVER silently change the user's request.
+
+For example:
+
+User:
+"Add a hello() function to a Python file."
+
+Repository:
+React/Vite
+No Python files
+
+Correct behavior:
+
+1. Verify that no suitable Python file exists.
+2. Do not switch to JavaScript.
+3. Do not modify App.jsx.
+4. Do not invent an unrelated file.
+5. Do not reinterpret the task.
+6. If the user explicitly requested Python and no appropriate
+   Python file exists, report that limitation.
+7. Stop unless the available tools can safely create the
+   specifically requested Python file.
+
+Incorrect behavior:
+
+- Add hello() to App.jsx.
+- Add hello() to a JavaScript file.
+- Convert the request into a React task.
+- Modify an unrelated file.
+- Keep searching indefinitely.
+
+============================================================
+LANGUAGE AND FRAMEWORK RULES
+============================================================
+
+If the user explicitly requests Python:
+
+Only modify Python code/files unless the task explicitly requires
+changes to another file.
+
+If the user explicitly requests JavaScript:
+
+Do not switch to Python.
+
+If the user explicitly requests Django:
+
+Do not replace the solution with Flask/FastAPI/Node/etc.
+
+If the user explicitly requests React:
+
+Do not replace it with another frontend framework.
+
+The repository may contain multiple languages.
+
+Use the language/framework relevant to the user's request.
+
+If the user does not specify a language or framework:
+
+Prefer the language/framework already used by the relevant
+repository area.
+
+============================================================
+REPOSITORY INVESTIGATION
+============================================================
+
+Before making a change:
+
+1. Understand the repository structure.
+2. Identify the relevant language/framework.
+3. Find the relevant file.
+4. Read the relevant file.
+5. Understand surrounding code.
+6. Determine the smallest safe modification.
+
+Once sufficient information has been gathered:
+
+STOP INVESTIGATING.
+
+Do not repeatedly search for the same information.
+
+============================================================
+WHEN THE REQUESTED FILE DOES NOT EXIST
+============================================================
+
+If the user asks to modify a file that does not exist:
+
+First determine whether another existing file is clearly intended.
+
+If no suitable file exists:
+
+If the user explicitly requested a particular language/file type,
+do not silently switch to another language.
+
+If creating a new file directly satisfies the user's request,
+use propose_new_file.
+
+Do not modify an unrelated existing file.
+
+============================================================
+BEFORE PROPOSING A CHANGE
+============================================================
+
+Verify all of the following:
+
+1. The target file is correct.
+2. If modifying an existing file, the target file was read.
+3. The requested language is correct.
+4. The requested framework is correct.
+5. The proposed change directly satisfies the task.
+6. Existing unrelated functionality is preserved.
+7. The change is actually different from the current file.
+8. No unrelated functionality is being changed.
+
+If any condition fails:
+
+Do not propose the change.
+
+============================================================
+MINIMAL CHANGE PRINCIPLE
+============================================================
+
+Make the smallest reasonable change required by the user.
+
+Do not:
+- rewrite entire files unnecessarily
+- refactor unrelated code
+- rename unrelated variables
+- modify unrelated tests
+- change dependencies unnecessarily
+- change architecture without permission
+
+============================================================
+GIT WORKFLOW
+============================================================
+
+DevPilot works inside an isolated cloned repository workspace.
+
+The AI may inspect Git status and diffs.
+
+The AI must NOT directly create branches, commit changes,
+or push changes.
+
+After human approval, the LangGraph workflow controls the
+Git branch creation.
+
+The branch is created before the approved file modification.
+
+The current workflow does NOT push to GitHub yet.
+
+============================================================
+TESTS
+============================================================
+
+After an approved change:
+
+- Run the repository's appropriate test/build command.
+- Use the existing project's tooling.
+- Do not assume pytest for a JavaScript repository.
+- Do not assume npm for a Python repository.
+- Use the repository structure/package configuration to determine
+  the appropriate test command.
+
+If tests pass:
+
+Complete the run.
+
+If tests fail:
+
+Analyze the actual failure.
+
+============================================================
+DEBUGGING
+============================================================
+
+When tests fail:
+
+1. Identify the actual failing test/file.
+2. Read the actual failing file.
+3. Use the actual test output.
+4. Do not invent files.
+5. Do not invent functions.
+6. Do not invent APIs.
+7. Do not blindly modify the failing test.
+8. Preserve existing architecture.
+9. Propose the smallest meaningful fix.
+
+If the failure is caused by a placeholder test such as:
+
+assert False
+
+do not replace it with:
+
+assert True
+
+or:
+
+pass
+
+Instead, explain that the test does not contain enough meaningful
+behavior to determine the intended implementation.
+
+============================================================
+HUMAN-IN-THE-LOOP
+============================================================
+
+The AI must never directly modify files.
+
+Every file modification must go through:
+
+AI proposal
+    ↓
+Human approval
+    ↓
+Git branch creation
+    ↓
+Write
+    ↓
+Test
+
+AI-generated debug fixes must also require human approval.
+
+Never reuse an old approval decision for a new proposal.
+
+============================================================
+STOP CONDITIONS
+============================================================
+
+Stop when:
+
+1. The requested change cannot safely be completed.
+2. Required information does not exist.
+3. Available tools cannot perform the required operation.
+4. The requested change has been completed and tests pass.
+5. A human rejects a proposed change.
+6. The investigation limit has been reached.
+7. The debug retry limit has been reached.
+8. Git branch creation fails.
+
+Never loop indefinitely.
 """
 
 
 # ============================================================
-# 4. MAIN AGENT NODE
+# 7. HELPER: EXTRACT MESSAGE CONTENT
+# ============================================================
+
+def message_text(content) -> str:
+    """
+    Normalize LangChain message content into plain text.
+    """
+
+    if isinstance(content, str):
+
+        return content
+
+    if isinstance(content, list):
+
+        parts = []
+
+        for item in content:
+
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+            ):
+
+                parts.append(
+                    item.get("text", "")
+                )
+
+            elif isinstance(item, str):
+
+                parts.append(item)
+
+        return "\n".join(parts)
+
+    return str(content)
+
+
+# ============================================================
+# 8. MAIN AGENT NODE
 # ============================================================
 
 def agent_node(state: AgentState):
-    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
+
+    workspace_token = set_workspace(
+        state.get(
+            "workspace_path",
+            "workspace"
+        )
+    )
+
     try:
+
+        step_count = (
+            state.get(
+                "agent_steps",
+                0
+            )
+            + 1
+        )
+
+        task = state.get(
+            "task",
+            ""
+        )
+
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(
+                content=(
+                    SYSTEM_PROMPT
+                    + "\n\n"
+                    + "CURRENT USER TASK:\n"
+                    + task
+                )
+            ),
             *state["messages"],
         ]
+
         response = invoke_llm(
             messages,
             tools=[
@@ -184,16 +674,26 @@ def agent_node(state: AgentState):
                 read_file,
                 list_dir,
                 propose_file_change,
+                propose_new_file,
                 git_diff,
+                git_status,
             ],
         )
-        return {"messages": [response]}
+
+        return {
+            "messages": [response],
+            "agent_steps": step_count,
+        }
+
     finally:
-        reset_workspace(workspace_token)
+
+        reset_workspace(
+            workspace_token
+        )
 
 
 # ============================================================
-# 5. TOOL NODE
+# 9. TOOL NODE
 # ============================================================
 
 tool_executor = ToolNode([
@@ -201,105 +701,225 @@ tool_executor = ToolNode([
     read_file,
     list_dir,
     propose_file_change,
+    propose_new_file,
     git_diff,
+    git_status,
 ])
 
+
 def tool_node(state: AgentState):
-    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
+
+    workspace_token = set_workspace(
+        state.get(
+            "workspace_path",
+            "workspace"
+        )
+    )
+
     try:
-        return tool_executor.invoke(state)
+
+        return tool_executor.invoke(
+            state
+        )
+
     finally:
-        reset_workspace(workspace_token)
+
+        reset_workspace(
+            workspace_token
+        )
 
 
 # ============================================================
-# 6. TOOL ROUTING
+# 10. TOOL ROUTING
 # ============================================================
 
 def route_after_tools(state: AgentState):
-    """Route proposal results to extraction; otherwise continue analysis."""
+    """
+    Route proposal results to proposal extraction.
+
+    All other tool results go back to the agent.
+    """
+
     last_message = state["messages"][-1]
-    if last_message.name == "propose_file_change":
+
+    if getattr(
+        last_message,
+        "name",
+        ""
+    ) in {
+        "propose_file_change",
+        "propose_new_file",
+    }:
+
         return "extract_proposal"
+
     return "agent"
 
 
 # ============================================================
-# 7. EXTRACT FILE PROPOSAL
+# 11. EXTRACT FILE PROPOSAL
 # ============================================================
 
-def extract_proposal_node(state: AgentState):
+def extract_proposal_node(
+    state: AgentState
+):
 
     last_message = state["messages"][-1]
 
-    content = last_message.content
+    content = message_text(
+        last_message.content
+    )
 
     if not content:
-        return {}
 
-    import ast
+        return {}
 
     try:
-        result = ast.literal_eval(content)
 
-    except (ValueError, SyntaxError):
-        return {}
+        result = ast.literal_eval(
+            content
+        )
 
-    if not isinstance(result, dict):
-        return {}
+    except (
+        ValueError,
+        SyntaxError
+    ):
 
-    if result.get("status") != "pending_approval":
-        return {}
-
-    proposed_path = str(result.get("path", "")).strip()
-    proposed_content = result.get("proposed_content", "")
-
-    # Never send an empty path to the approval/write stages.
-    if not proposed_path or not isinstance(proposed_content, str):
         return {
             "proposed_path": "",
             "proposed_content": "",
-            "final_result": "Invalid file-change proposal: a non-empty file path is required."
+            "proposal_type": "",
+            "final_result": (
+                "Unable to parse the file-change proposal."
+            )
         }
+
+    if not isinstance(
+        result,
+        dict
+    ):
+
+        return {
+            "proposed_path": "",
+            "proposed_content": "",
+            "proposal_type": "",
+            "final_result": (
+                "Invalid file-change proposal."
+            )
+        }
+
+    proposal_status = result.get(
+        "status"
+    )
+
+    if proposal_status not in {
+        "pending_approval",
+        "pending_new_file_approval",
+    }:
+
+        return {
+            "proposed_path": "",
+            "proposed_content": "",
+            "proposal_type": "",
+        }
+
+    proposed_path = str(
+        result.get(
+            "path",
+            ""
+        )
+    ).strip()
+
+    proposed_content = result.get(
+        "proposed_content",
+        ""
+    )
+
+    if (
+        not proposed_path
+        or not isinstance(
+            proposed_content,
+            str
+        )
+    ):
+
+        return {
+            "proposed_path": "",
+            "proposed_content": "",
+            "proposal_type": "",
+            "final_result": (
+                "Invalid file-change proposal: "
+                "a non-empty path and valid content are required."
+            )
+        }
+
+    if proposal_status == "pending_new_file_approval":
+
+        proposal_type = "new_file"
+
+    else:
+
+        proposal_type = "existing_file"
 
     return {
         "proposed_path": proposed_path,
-        "proposed_content": proposed_content
+        "proposed_content": proposed_content,
+        "proposal_type": proposal_type,
     }
 
 
 # ============================================================
-# 8. AGENT ROUTING
+# 12. AGENT ROUTING
 # ============================================================
 
-def should_continue(state: AgentState):
-    """Only enter HITL when a valid proposal exists."""
+def should_continue(
+    state: AgentState
+):
+
     last_message = state["messages"][-1]
-    if last_message.tool_calls:
+
+    # Tool calls have priority.
+    if getattr(
+        last_message,
+        "tool_calls",
+        None
+    ):
+
         return "tools"
 
-    if state.get("proposed_path") and state.get("proposed_content"):
+    # Valid proposal exists.
+    if (
+        state.get(
+            "proposed_path"
+        )
+        and state.get(
+            "proposed_content"
+        )
+    ):
+
         return "approval"
 
-    # The model must keep working until it produces a concrete proposal.
+    # Prevent infinite investigation loops.
+    if (
+        state.get(
+            "agent_steps",
+            0
+        )
+        >= MAX_AGENT_STEPS
+    ):
+
+        return "stop"
+
     return "agent"
 
 
 # ============================================================
-# 9. HUMAN APPROVAL NODE
+# 13. HUMAN APPROVAL NODE
 # ============================================================
 
-def approval_node(state: AgentState):
-
-    if not state.get("proposed_path") or not isinstance(state.get("proposed_content"), str):
-        return {"approval": "reject"}
-
-    # If this node is being resumed after HITL,
-    # the approval value has already been supplied.
-    if state.get("approval") in ["approve", "reject"]:
-        return {
-            "approval": state["approval"]
-        }
+def approval_node(
+    state: AgentState
+):
 
     proposed_path = state.get(
         "proposed_path",
@@ -311,114 +931,353 @@ def approval_node(state: AgentState):
         ""
     )
 
+    if (
+        not proposed_path
+        or not isinstance(
+            proposed_content,
+            str
+        )
+    ):
+
+        return {
+            "approval": "reject"
+        }
+
+    # If the graph is resumed after interrupt(),
+    # LangGraph supplies the new decision.
+    #
+    # The write node resets approval after consuming it,
+    # so a later debug fix cannot accidentally reuse the
+    # previous decision.
+
+    if state.get(
+        "approval"
+    ) in (
+        "approve",
+        "reject"
+    ):
+
+        return {
+            "approval": state["approval"]
+        }
+
     decision = interrupt({
-        "question": "Do you approve this code change?",
 
-        "message": (
-            "DevPilot AI is requesting approval "
-            "before modifying files."
-        ),
+        "question":
+            "Do you approve this code change?",
 
-        "path": proposed_path,
+        "message":
+            "DevPilot AI is requesting human approval "
+            "before modifying files.",
 
-        "content": proposed_content
+        "path":
+            proposed_path,
+
+        "content":
+            proposed_content,
     })
 
     return {
         "approval": decision
     }
 
+
 # ============================================================
-# 10. APPROVAL ROUTING
+# 14. REJECTION NODE
 # ============================================================
 
-def route_after_approval(state: AgentState):
+def rejected_node(
+    state: AgentState
+):
 
-    if state["approval"] == "approve":
+    return {
+        "final_result":
+            "Human rejected the proposed change. "
+            "No files were modified.",
+
+        "test_result":
+            "",
+
+        "debug_result":
+            "",
+
+        "branch_result":
+            "",
+    }
+
+
+# ============================================================
+# 15. APPROVAL ROUTING
+# ============================================================
+
+def route_after_approval(
+    state: AgentState
+):
+
+    if state.get(
+        "approval"
+    ) == "approve":
+
+        return "create_branch"
+
+    return "rejected"
+
+
+# ============================================================
+# 16. CREATE GIT BRANCH
+# ============================================================
+
+def create_branch_node(
+    state: AgentState
+):
+    """
+    Create a dedicated Git branch for this DevPilot run.
+
+    This operation is controlled by LangGraph.
+    The LLM cannot directly invoke this operation.
+    """
+
+    thread_id = state.get(
+        "thread_id",
+        ""
+    )
+
+    workspace_path = state.get(
+        "workspace_path",
+        ""
+    )
+
+    if not thread_id:
+
+        return {
+            "branch_result":
+                "error: thread ID is missing."
+        }
+
+    if not workspace_path:
+
+        return {
+            "branch_result":
+                "error: workspace path is missing."
+        }
+
+    branch_name = (
+        f"devpilot/{thread_id}"
+    )
+
+    workspace_token = set_workspace(
+        workspace_path
+    )
+
+    try:
+
+        result = create_agent_branch.invoke({
+            "branch_name":
+                branch_name
+        })
+
+        if not isinstance(
+            result,
+            dict
+        ):
+
+            return {
+                "branch_result":
+                    f"error: {result}"
+            }
+
+        if result.get(
+            "status"
+        ) != "success":
+
+            return {
+                "branch_result":
+                    f"error: {result}"
+            }
+
+        return {
+            "branch_result":
+                f"success: {branch_name}"
+        }
+
+    except Exception as exc:
+
+        return {
+            "branch_result":
+                f"error: {exc}"
+        }
+
+    finally:
+
+        reset_workspace(
+            workspace_token
+        )
+
+
+# ============================================================
+# 17. BRANCH ROUTING
+# ============================================================
+
+def route_after_branch(
+    state: AgentState
+):
+
+    branch_result = state.get(
+        "branch_result",
+        ""
+    )
+
+    if branch_result.startswith(
+        "success:"
+    ):
+
         return "write"
 
     return END
 
 
 # ============================================================
-# 11. WRITE NODE
+# 18. WRITE NODE
 # ============================================================
 
-def write_node(state: AgentState):
+def write_node(
+    state: AgentState
+):
 
-    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
+    workspace_token = set_workspace(
+        state.get(
+            "workspace_path",
+            "workspace"
+        )
+    )
+
     try:
-        result = write_file.invoke({
-        "path": state["proposed_path"],
-        "content": state["proposed_content"]
-    })
+
+        proposal_type = state.get(
+            "proposal_type",
+            "existing_file"
+        )
+
+        if proposal_type == "new_file":
+
+            result = write_new_file.invoke({
+                "path":
+                    state["proposed_path"],
+
+                "content":
+                    state["proposed_content"],
+            })
+
+        else:
+
+            result = write_file.invoke({
+                "path":
+                    state["proposed_path"],
+
+                "content":
+                    state["proposed_content"],
+            })
 
         return {
-            "final_result": str(result),
 
-            # Reset the consumed approval decision. Without this, a
-        # second approval checkpoint later in the SAME run (e.g. the
-        # AI-fix proposal after a failed test) would hit the "already
-        # decided" branch in approval_node with the OLD decision and
-        # skip asking a human again — silently auto-approving the
-        # AI's fix.
-            "approval": ""
+            "final_result":
+                str(result),
+
+            # Consume the current approval decision.
+            "approval":
+                "",
+
+            # Clear the consumed proposal.
+            "proposed_path":
+                "",
+
+            "proposed_content":
+                "",
+
+            "proposal_type":
+                "",
         }
+
     finally:
-        reset_workspace(workspace_token)
+
+        reset_workspace(
+            workspace_token
+        )
 
 
 # ============================================================
-# 12. TEST NODE
+# 19. TEST NODE
 # ============================================================
 
-def test_node(state: AgentState):
-    workspace_token = set_workspace(state.get("workspace_path", "workspace"))
+def test_node(
+    state: AgentState
+):
+
+    workspace_token = set_workspace(
+        state.get(
+            "workspace_path",
+            "workspace"
+        )
+    )
+
     try:
+
         result = run_tests.invoke({})
 
         return {
-            "test_result": str(result)
+            "test_result":
+                str(result)
         }
+
     finally:
-        reset_workspace(workspace_token)
+
+        reset_workspace(
+            workspace_token
+        )
 
 
 # ============================================================
-# 13. TEST RESULT ROUTING
+# 20. TEST RESULT ROUTING
 # ============================================================
 
-def route_after_test(state: AgentState):
+def route_after_test(
+    state: AgentState
+):
 
-    test_result = state["test_result"]
+    test_result = state.get(
+        "test_result",
+        ""
+    )
 
     if "'status': 'passed'" in test_result:
+
         return "done"
 
     return "debug"
 
 
 # ============================================================
-# 14. DETERMINISTIC DEBUG ANALYZER
+# 21. DETERMINISTIC DEBUG ANALYZER
 # ============================================================
 
-def debug_node(state: AgentState):
-    """
-    Analyze pytest failure output without using the LLM.
+def debug_node(
+    state: AgentState
+):
 
-    This node extracts the failed file and test.
-    """
-
-    test_result = state["test_result"]
+    test_result = state.get(
+        "test_result",
+        ""
+    )
 
     if "FAILED" not in test_result:
 
         return {
-            "debug_result": "No test failure detected.",
-            "failed_file": ""
-        }
+            "debug_result":
+                "No test failure detected.",
 
-    import re
+            "failed_file":
+                "",
+        }
 
     match = re.search(
         r"FAILED\s+([^\s:]+)::([^\s-]+)",
@@ -428,98 +1287,116 @@ def debug_node(state: AgentState):
     if match:
 
         failed_file = match.group(1)
+
         failed_test = match.group(2)
 
     else:
 
         failed_file = "Unknown"
+
         failed_test = "Unknown"
 
     debug_result = {
-        "status": "failure_detected",
-        "failed_file": failed_file,
-        "failed_test": failed_test,
-        "message": "Pytest reported a test failure."
+        "status":
+            "failure_detected",
+
+        "failed_file":
+            failed_file,
+
+        "failed_test":
+            failed_test,
+
+        "message":
+            "Pytest reported a test failure.",
     }
 
     return {
-        "debug_result": str(debug_result),
-        "failed_file": failed_file
+        "debug_result":
+            str(debug_result),
+
+        "failed_file":
+            failed_file,
     }
 
 
 # ============================================================
-# 15. AI DEBUG AGENT
+# 22. AI DEBUG AGENT
 # ============================================================
 
-def ai_debug_node(state: AgentState):
+def ai_debug_node(
+    state: AgentState
+):
 
-    debug_result = state["debug_result"]
-    test_result = state["test_result"]
-
-    # Get the failing file directly from deterministic state.
-    # Do not try to parse it from the AI's response.
-    failed_file = state.get(
-        "failed_file",
-        ""
+    workspace_token = set_workspace(
+        state.get(
+            "workspace_path",
+            "workspace"
+        )
     )
-
-    # Read the actual failing file before asking Gemini.
-        # Read the failing test file.
-    test_file_content = ""
-
-    if failed_file:
-
-        try:
-
-            result = read_file.invoke({
-                "path": failed_file
-            })
-
-            if isinstance(result, dict):
-
-                test_file_content = result.get(
-                    "content",
-                    ""
-                )
-
-            else:
-
-                test_file_content = str(result)
-
-        except Exception as e:
-
-            test_file_content = (
-                f"Unable to read {failed_file}: {e}"
-            )
-
-
-    # Read the implementation file used by the test.
-    implementation_content = ""
 
     try:
 
-        result = read_file.invoke({
-            "path": "auth.py"
-        })
-
-        if isinstance(result, dict):
-
-            implementation_content = result.get(
-                "content",
-                ""
-            )
-
-        else:
-
-            implementation_content = str(result)
-
-    except Exception as e:
-
-        implementation_content = (
-            f"Unable to read auth.py: {e}"
+        debug_result = state.get(
+            "debug_result",
+            ""
         )
-    prompt = f"""
+
+        test_result = state.get(
+            "test_result",
+            ""
+        )
+
+        failed_file = state.get(
+            "failed_file",
+            ""
+        )
+
+        test_file_content = ""
+
+        # ----------------------------------------------------
+        # Read actual failing file
+        # ----------------------------------------------------
+
+        if (
+            failed_file
+            and failed_file != "Unknown"
+        ):
+
+            try:
+
+                result = read_file.invoke({
+                    "path":
+                        failed_file
+                })
+
+                if isinstance(
+                    result,
+                    dict
+                ):
+
+                    test_file_content = result.get(
+                        "content",
+                        ""
+                    )
+
+                else:
+
+                    test_file_content = str(
+                        result
+                    )
+
+            except Exception as exc:
+
+                test_file_content = (
+                    f"Unable to read "
+                    f"{failed_file}: {exc}"
+                )
+
+        # ----------------------------------------------------
+        # Debug prompt
+        # ----------------------------------------------------
+
+        prompt = f"""
 You are the Debug Agent inside DevPilot AI.
 
 A software test has failed.
@@ -527,15 +1404,13 @@ A software test has failed.
 Detected failure:
 {debug_result}
 
-Full pytest result:
+Full test result:
 {test_result}
 
-Actual contents of the failing test file:
+Actual contents of the failing file:
 {test_file_content}
 
-Actual contents of the implementation file:
-{implementation_content}
-Analyze the failure using the ACTUAL FILE CONTENT above.
+Analyze the failure using ONLY the actual information above.
 
 Provide:
 
@@ -546,88 +1421,125 @@ Provide:
 
 Important rules:
 
-- Base your analysis on the actual file content.
-- Do not invent functions, classes, variables, APIs, or files.
+- Base the diagnosis on the actual test output.
+- Base the diagnosis on actual file contents.
+- Do not invent files.
+- Do not invent functions.
+- Do not invent classes.
+- Do not invent APIs.
+- Do not assume a file such as auth.py exists.
+- Do not assume the repository is Python.
 - Preserve the existing architecture.
-- Do not modify any files.
-- If the failing assertion is only a placeholder such as `assert False`,
-  explicitly identify that.
-- If more information is required, say what information is missing.
+- Do not modify files.
+- If the failing assertion is a placeholder such as:
+  assert False
+  explicitly identify it.
+- If the available information is insufficient,
+  clearly state what information is missing.
+- Do not recommend changing an unrelated file.
 
 Be concise and technically specific.
 """
 
-    response = invoke_llm(prompt)
+        response = invoke_llm(
+            prompt
+        )
 
-    content = response.content
+        content = message_text(
+            response.content
+        )
 
-    if isinstance(content, list):
+        return {
+            "debug_result":
+                content
+        }
 
-        text_parts = []
+    finally:
 
-        for item in content:
-
-            if (
-                isinstance(item, dict)
-                and item.get("type") == "text"
-            ):
-
-                text_parts.append(
-                    item.get("text", "")
-                )
-
-        content = "\n".join(text_parts)
-
-    return {
-        "debug_result": content
-    }
+        reset_workspace(
+            workspace_token
+        )
 
 
 # ============================================================
-# 16. DEBUG FIX PREPARATION
+# 23. DEBUG FIX PREPARATION
 # ============================================================
 
-def prepare_debug_fix_node(state: AgentState):
+def prepare_debug_fix_node(
+    state: AgentState
+):
 
-    debug_result = state["debug_result"]
-    test_result = state["test_result"]
-
-    # Get the failing file directly from state.
-    failed_file = state.get(
-        "failed_file",
-        ""
+    current_attempts = (
+        state.get(
+            "debug_attempts",
+            0
+        )
     )
 
-    # Read the actual file before proposing a fix.
-    file_content = ""
+    if current_attempts >= MAX_DEBUG_ATTEMPTS:
 
-    if failed_file:
+        return {
+            "debug_result": (
+                "Maximum debug attempts reached. "
+                "DevPilot stopped the automatic fix loop."
+            ),
 
-        try:
+            "proposed_path":
+                "",
 
-            result = read_file.invoke({
-                "path": failed_file
-            })
+            "proposed_content":
+                "",
 
-            if isinstance(result, dict):
+            "proposal_type":
+                "",
+        }
 
-                file_content = result.get(
-                    "content",
-                    ""
-                )
+    workspace_token = set_workspace(
+        state.get(
+            "workspace_path",
+            "workspace"
+        )
+    )
 
-            else:
+    try:
 
-                file_content = str(result)
+        debug_result = state.get(
+            "debug_result",
+            ""
+        )
 
-            # If the file was not found, try the workspace path.
-            if "File does not exist" in file_content:
+        test_result = state.get(
+            "test_result",
+            ""
+        )
+
+        failed_file = state.get(
+            "failed_file",
+            ""
+        )
+
+        file_content = ""
+
+        # ----------------------------------------------------
+        # Read actual failing file
+        # ----------------------------------------------------
+
+        if (
+            failed_file
+            and failed_file != "Unknown"
+        ):
+
+            try:
 
                 result = read_file.invoke({
-                    "path": f"workspace/{failed_file}"
+                    "path":
+                        failed_file
                 })
 
-                if isinstance(result, dict):
+                if isinstance(
+                    result,
+                    dict
+                ):
 
                     file_content = result.get(
                         "content",
@@ -636,164 +1548,288 @@ def prepare_debug_fix_node(state: AgentState):
 
                 else:
 
-                    file_content = str(result)
+                    file_content = str(
+                        result
+                    )
 
-        except Exception as e:
+            except Exception as exc:
 
-            file_content = (
-                f"Unable to read {failed_file}: {e}"
-            )
+                file_content = (
+                    f"Unable to read "
+                    f"{failed_file}: {exc}"
+                )
 
-    # --------------------------------------------------------
-    # SAFETY CHECK
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # Placeholder test protection
+        # ----------------------------------------------------
 
-    # Never replace a placeholder assertion with
-    # meaningless code such as `assert True`.
-    if "assert False" in file_content:
+        if "assert False" in file_content:
 
-        return {
-            "debug_result": (
-                "The failing test contains a placeholder "
-                "`assert False`. DevPilot cannot safely "
-                "generate a meaningful replacement without "
-                "knowing the intended login behavior."
-            ),
-            "proposed_path": "",
-            "proposed_content": ""
-        }
+            return {
+                "debug_result": (
+                    "The failing test contains a placeholder "
+                    "`assert False`. DevPilot cannot safely "
+                    "generate a meaningful replacement without "
+                    "knowing the intended behavior."
+                ),
 
-    # --------------------------------------------------------
-    # FIX PROPOSAL PROMPT
-    # --------------------------------------------------------
+                "proposed_path":
+                    "",
 
-    prompt = f"""
+                "proposed_content":
+                    "",
+
+                "proposal_type":
+                    "",
+            }
+
+        # ----------------------------------------------------
+        # Fix proposal prompt
+        # ----------------------------------------------------
+
+        prompt = f"""
 You are the Fix Proposal Agent inside DevPilot AI.
 
-A test has failed and another AI agent has already analyzed the failure.
+A test has failed and another AI agent has diagnosed the failure.
 
 AI Debug Diagnosis:
 {debug_result}
 
-Pytest Result:
+Test Result:
 {test_result}
+
+Failing File:
+{failed_file}
 
 Actual contents of the failing file:
 {file_content}
 
-Your task is to propose a concrete code fix.
+Your job is to determine whether a safe, concrete code fix can
+be proposed.
 
-Rules:
+IMPORTANT:
 
-1. Do not modify any files.
-2. Identify the exact file that should be changed.
-3. Provide the complete proposed content of that file.
-4. Preserve existing code that does not need to change.
-5. Make the smallest reasonable change required to fix the failure.
-6. Do not change the test merely to make the test pass unless the diagnosis clearly
-   indicates that the test itself is incorrect.
-7. Base the proposed fix on the actual file content.
-8. Do not invent functions, classes, APIs, or modules that are not present.
-9. Do not replace a placeholder assertion such as `assert False`
-   with `assert True` or `pass`.
-10. If there is insufficient information to create a meaningful fix,
-    clearly state that instead of inventing code.
+- Do not modify files.
+- Do not invent files.
+- Do not invent functions.
+- Do not invent classes.
+- Do not invent APIs.
+- Do not assume a specific framework.
+- Do not assume a specific implementation file.
+- Do not replace placeholder assertions with meaningless code.
+- Preserve existing functionality.
+- Make the smallest reasonable change.
+- Do not modify tests merely to make them pass.
+- The proposed fix must target an existing file.
+- If the actual implementation file is not known from the available
+  evidence, do NOT invent one.
+- If there is insufficient information to create a meaningful fix,
+  clearly say so.
 
-Return the result using exactly this format:
+If a safe fix can be proposed, return EXACTLY:
 
-FILE: <exact file path>
+FILE: <exact existing file path>
 
 CODE:
-<complete proposed file content>
+<complete proposed content of that existing file>
+
+If a safe fix cannot be proposed, return:
+
+CANNOT_FIX:
+<reason>
+
+Do not use markdown code fences.
 """
 
-    response = invoke_llm(prompt)
+        response = invoke_llm(
+            prompt
+        )
 
-    content = response.content
-
-    if isinstance(content, list):
-
-        text_parts = []
-
-        for item in content:
-
-            if (
-                isinstance(item, dict)
-                and item.get("type") == "text"
-            ):
-
-                text_parts.append(
-                    item.get("text", "")
-                )
-
-        content = "\n".join(text_parts)
-
-    content = content.strip()
-
-    # Make sure the expected format exists.
-    if (
-        "FILE:" not in content
-        or "CODE:" not in content
-    ):
-
-        return {
-            "debug_result": content,
-            "proposed_path": "",
-            "proposed_content": ""
-        }
-
-    # Separate FILE and CODE sections.
-    file_part, code_part = content.split(
-        "CODE:",
-        1
-    )
-
-    proposed_path = file_part.replace(
-        "FILE:",
-        "",
-        1
-    ).strip()
-
-    proposed_content = code_part.strip()
-
-    # Remove markdown code fences if Gemini adds them.
-    if proposed_content.startswith("```"):
-
-        lines = proposed_content.splitlines()
-
-        if (
-            lines
-            and lines[0].startswith("```")
-        ):
-
-            lines = lines[1:]
-
-        if (
-            lines
-            and lines[-1].strip() == "```"
-        ):
-
-            lines = lines[:-1]
-
-        proposed_content = "\n".join(
-            lines
+        content = message_text(
+            response.content
         ).strip()
 
-    return {
-        "proposed_path": proposed_path,
-        "proposed_content": proposed_content
-    }
+        # ----------------------------------------------------
+        # Cannot-fix response
+        # ----------------------------------------------------
+
+        if content.startswith(
+            "CANNOT_FIX:"
+        ):
+
+            return {
+                "debug_result":
+                    content,
+
+                "proposed_path":
+                    "",
+
+                "proposed_content":
+                    "",
+
+                "proposal_type":
+                    "",
+            }
+
+        # ----------------------------------------------------
+        # Validate expected response
+        # ----------------------------------------------------
+
+        if (
+            "FILE:" not in content
+            or "CODE:" not in content
+        ):
+
+            return {
+                "debug_result":
+                    content,
+
+                "proposed_path":
+                    "",
+
+                "proposed_content":
+                    "",
+
+                "proposal_type":
+                    "",
+            }
+
+        # ----------------------------------------------------
+        # Separate FILE and CODE
+        # ----------------------------------------------------
+
+        file_part, code_part = content.split(
+            "CODE:",
+            1
+        )
+
+        proposed_path = (
+            file_part
+            .replace(
+                "FILE:",
+                "",
+                1
+            )
+            .strip()
+        )
+
+        proposed_content = (
+            code_part
+            .strip()
+        )
+
+        # ----------------------------------------------------
+        # Remove accidental code fences
+        # ----------------------------------------------------
+
+        if proposed_content.startswith(
+            "```"
+        ):
+
+            lines = (
+                proposed_content
+                .splitlines()
+            )
+
+            if (
+                lines
+                and lines[0].startswith(
+                    "```"
+                )
+            ):
+
+                lines = lines[1:]
+
+            if (
+                lines
+                and lines[-1].strip()
+                == "```"
+            ):
+
+                lines = lines[:-1]
+
+            proposed_content = (
+                "\n".join(lines)
+                .strip()
+            )
+
+        # ----------------------------------------------------
+        # Validate proposal
+        # ----------------------------------------------------
+
+        if not proposed_path:
+
+            return {
+                "debug_result":
+                    "Debug agent returned an empty file path.",
+
+                "proposed_path":
+                    "",
+
+                "proposed_content":
+                    "",
+
+                "proposal_type":
+                    "",
+            }
+
+        if not proposed_content:
+
+            return {
+                "debug_result":
+                    "Debug agent returned empty file content.",
+
+                "proposed_path":
+                    "",
+
+                "proposed_content":
+                    "",
+
+                "proposal_type":
+                    "",
+            }
+
+        # ----------------------------------------------------
+        # Increment debug attempt only when a proposal exists
+        # ----------------------------------------------------
+
+        return {
+            "proposed_path":
+                proposed_path,
+
+            "proposed_content":
+                proposed_content,
+
+            # Debug fixes always target an existing file.
+            "proposal_type":
+                "existing_file",
+
+            "debug_attempts":
+                current_attempts + 1,
+        }
+
+    finally:
+
+        reset_workspace(
+            workspace_token
+        )
 
 
 # ============================================================
-# 17. DEBUG FIX ROUTING
+# 24. DEBUG FIX ROUTING
 # ============================================================
 
-def route_after_debug_fix(state: AgentState):
+def route_after_debug_fix(
+    state: AgentState
+):
 
     if (
-        state["proposed_path"]
-        and state["proposed_content"]
+        state.get(
+            "proposed_path"
+        )
+        and state.get(
+            "proposed_content"
+        )
     ):
 
         return "approval"
@@ -802,14 +1838,16 @@ def route_after_debug_fix(state: AgentState):
 
 
 # ============================================================
-# 18. GRAPH BUILDER
+# 25. GRAPH BUILDER
 # ============================================================
 
-graph_builder = StateGraph(AgentState)
+graph_builder = StateGraph(
+    AgentState
+)
 
 
 # ============================================================
-# 19. REGISTER NODES
+# 26. REGISTER NODES
 # ============================================================
 
 graph_builder.add_node(
@@ -825,6 +1863,16 @@ graph_builder.add_node(
 graph_builder.add_node(
     "approval",
     approval_node
+)
+
+graph_builder.add_node(
+    "rejected",
+    rejected_node
+)
+
+graph_builder.add_node(
+    "create_branch",
+    create_branch_node
 )
 
 graph_builder.add_node(
@@ -859,7 +1907,7 @@ graph_builder.add_node(
 
 
 # ============================================================
-# 20. START → AGENT
+# 27. START → AGENT
 # ============================================================
 
 graph_builder.add_edge(
@@ -869,69 +1917,122 @@ graph_builder.add_edge(
 
 
 # ============================================================
-# 21. AGENT → TOOLS / APPROVAL
+# 28. AGENT → TOOLS / APPROVAL / STOP
 # ============================================================
 
 graph_builder.add_conditional_edges(
     "agent",
     should_continue,
     {
-        "tools": "tools",
-        "approval": "approval",
-        "agent": "agent"
+        "tools":
+            "tools",
+
+        "approval":
+            "approval",
+
+        "agent":
+            "agent",
+
+        "stop":
+            END,
     }
 )
 
 
 # ============================================================
-# 22. TOOLS → AGENT / EXTRACT PROPOSAL
+# 29. TOOLS → AGENT / EXTRACT PROPOSAL
 # ============================================================
 
 graph_builder.add_conditional_edges(
     "tools",
     route_after_tools,
     {
-        "agent": "agent",
-        "extract_proposal": "extract_proposal"
+        "agent":
+            "agent",
+
+        "extract_proposal":
+            "extract_proposal",
     }
 )
 
 
 # ============================================================
-# 23. EXTRACT PROPOSAL → APPROVAL / AGENT
+# 30. EXTRACT PROPOSAL → APPROVAL / AGENT
 # ============================================================
 
-def route_after_extract_proposal(state: AgentState):
-    if state.get("proposed_path") and isinstance(state.get("proposed_content"), str):
+def route_after_extract_proposal(
+    state: AgentState
+):
+
+    if (
+        state.get(
+            "proposed_path"
+        )
+        and isinstance(
+            state.get(
+                "proposed_content"
+            ),
+            str
+        )
+        and state.get(
+            "proposed_content"
+        )
+    ):
+
         return "approval"
+
     return "agent"
+
 
 graph_builder.add_conditional_edges(
     "extract_proposal",
     route_after_extract_proposal,
     {
-        "approval": "approval",
-        "agent": "agent",
+        "approval":
+            "approval",
+
+        "agent":
+            "agent",
     }
 )
 
 
 # ============================================================
-# 24. APPROVAL → WRITE / END
+# 31. APPROVAL → CREATE BRANCH / REJECTED
 # ============================================================
 
 graph_builder.add_conditional_edges(
     "approval",
     route_after_approval,
     {
-        "write": "write",
-        END: END
+        "create_branch":
+            "create_branch",
+
+        "rejected":
+            "rejected",
     }
 )
 
 
 # ============================================================
-# 25. WRITE → TEST
+# 32. CREATE BRANCH → WRITE / END
+# ============================================================
+
+graph_builder.add_conditional_edges(
+    "create_branch",
+    route_after_branch,
+    {
+        "write":
+            "write",
+
+        END:
+            END,
+    }
+)
+
+
+# ============================================================
+# 33. WRITE → TEST
 # ============================================================
 
 graph_builder.add_edge(
@@ -941,21 +2042,34 @@ graph_builder.add_edge(
 
 
 # ============================================================
-# 26. TEST → DONE / DEBUG
+# 34. REJECTED → END
+# ============================================================
+
+graph_builder.add_edge(
+    "rejected",
+    END
+)
+
+
+# ============================================================
+# 35. TEST → DONE / DEBUG
 # ============================================================
 
 graph_builder.add_conditional_edges(
     "test",
     route_after_test,
     {
-        "done": END,
-        "debug": "debug"
+        "done":
+            END,
+
+        "debug":
+            "debug",
     }
 )
 
 
 # ============================================================
-# 27. DEBUG → AI DEBUG
+# 36. DEBUG → AI DEBUG
 # ============================================================
 
 graph_builder.add_edge(
@@ -965,7 +2079,7 @@ graph_builder.add_edge(
 
 
 # ============================================================
-# 28. AI DEBUG → PREPARE FIX
+# 37. AI DEBUG → PREPARE FIX
 # ============================================================
 
 graph_builder.add_edge(
@@ -975,71 +2089,180 @@ graph_builder.add_edge(
 
 
 # ============================================================
-# 29. PREPARE FIX → APPROVAL / END
+# 38. PREPARE FIX → APPROVAL / END
 # ============================================================
 
 graph_builder.add_conditional_edges(
     "prepare_debug_fix",
     route_after_debug_fix,
     {
-        "approval": "approval",
-        END: END
+        "approval":
+            "approval",
+
+        END:
+            END,
     }
 )
 
 
 # ============================================================
-# 30. CHECKPOINTER
-# ============================================================
-
-# ============================================================
-# 30. CHECKPOINTER
+# 39. CHECKPOINTER
 # ============================================================
 
 def create_checkpointer():
     """
-    Create a persistent PostgreSQL-backed LangGraph checkpoint store.
+    Create a persistent PostgreSQL-backed LangGraph
+    checkpoint store.
     """
 
-    uri = os.environ["LANGGRAPH_POSTGRES_URI"]
+    uri = os.environ[
+        "LANGGRAPH_POSTGRES_URI"
+    ]
 
     pool = ConnectionPool(
         conninfo=uri,
+
         min_size=1,
+
         max_size=5,
+
         kwargs={
-            "autocommit": True,
-            "prepare_threshold": 0,
+            "autocommit":
+                True,
+
+            "prepare_threshold":
+                0,
         },
     )
 
-    checkpointer = PostgresSaver(pool)
+    checkpointer = PostgresSaver(
+        pool
+    )
 
-    return pool, checkpointer
+    return (
+        pool,
+        checkpointer
+    )
 
 
-checkpoint_pool, checkpointer = create_checkpointer()
-atexit.register(checkpoint_pool.close)
+checkpoint_pool, checkpointer = (
+    create_checkpointer()
+)
+
+
+atexit.register(
+    checkpoint_pool.close
+)
+
 
 # ============================================================
-# 31. COMPILE GRAPH
+# 40. COMPILE GRAPH
 # ============================================================
 
 agent = graph_builder.compile(
     checkpointer=checkpointer
 )
 
-# NOTE: A single unified graph handles the entire flow:
-#   agent -> tools -> approval (HITL) -> write -> test
-#     -> (pass) END
-#     -> (fail) debug -> ai_debug -> prepare_debug_fix -> approval (HITL for AI fix) -> write -> test -> ...
-# The write/test/debug loop repeats automatically until tests pass,
-# the AI gives up (no proposal), or a human rejects a proposed fix.
-# There is intentionally no separate "debug_fix_graph" anymore — it was
-# a duplicate of this same loop kept only for isolated manual testing.
 
 # ============================================================
-# 32. DIRECT EXECUTION TEST
+# 41. GRAPH FLOW
+# ============================================================
+
+"""
+DevPilot AI unified workflow:
+
+                    ┌──────────────┐
+                    │    AGENT     │
+                    └──────┬───────┘
+                           │
+                    tool call?
+                     /          \
+                   yes           no
+                   /              \
+                TOOLS          proposal?
+                 │             /       \
+                 │           yes       no
+                 │            /         \
+                 └────────→ EXTRACT      AGENT
+                              │
+                              ▼
+                           APPROVAL
+                              │
+                        approve/reject
+                         /           \
+                    reject          approve
+                       │               │
+                   REJECTED       CREATE BRANCH
+                       │               │
+                      END             WRITE
+                                       │
+                                      TEST
+                                     /    \
+                                  pass    fail
+                                   │        │
+                                  END      DEBUG
+                                            │
+                                         AI DEBUG
+                                            │
+                                      PREPARE FIX
+                                            │
+                                         proposal?
+                                         /       \
+                                       yes        no
+                                        │          │
+                                    APPROVAL      END
+                                        │
+                                  CREATE BRANCH
+                                        │
+                                      WRITE
+                                        │
+                                      TEST
+                                        │
+                                      repeat
+
+
+Proposal types:
+
+Existing file:
+    propose_file_change
+            ↓
+    pending_approval
+            ↓
+       create branch
+            ↓
+       write_file()
+
+New file:
+    propose_new_file
+            ↓
+    pending_new_file_approval
+            ↓
+       create branch
+            ↓
+       write_new_file()
+
+
+Git safety:
+
+- Git status is available to the AI for inspection.
+- Branch creation is controlled by LangGraph.
+- The LLM cannot directly create branches.
+- Main/master cannot be used by create_agent_branch().
+- The branch is created only after human approval.
+- Current version does NOT commit or push yet.
+
+
+Safety limits:
+
+- MAX_AGENT_STEPS = 15
+- MAX_DEBUG_ATTEMPTS = 3
+
+Human approval is required for every proposed file modification.
+"""
+
+
+# ============================================================
+# 42. DIRECT EXECUTION TEST
 # ============================================================
 
 if __name__ == "__main__":
