@@ -10,8 +10,15 @@ class AgentRun(models.Model):
     )
     thread_id = models.UUIDField(unique=True, editable=False)
     task = models.TextField()
+    repo_url = models.CharField(max_length=300, blank=True, default="")
+    status = models.CharField(max_length=30, default="running")
+    pr_url = models.CharField(max_length=500, blank=True, default="")
+    summary = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
 
     def __str__(self):
         return f"{self.user.username} - {self.thread_id}"

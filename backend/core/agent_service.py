@@ -11,7 +11,9 @@ from langgraph.types import Command
 from core.agent import agent
 
 
-WORKSPACE_ROOT = Path("workspace").resolve()
+from django.conf import settings
+
+WORKSPACE_ROOT = Path(settings.DEVPILOT_WORKSPACE_ROOT).resolve()
 
 
 class ThreadOwnershipError(Exception):
@@ -95,14 +97,57 @@ def _prepare_repository(repo_url: str, thread_id: str) -> str:
     return str(repo_workspace)
 
 
-def create_agent_run(user, thread_id: str, task: str):
+def create_agent_run(user, thread_id: str, task: str, repo_url: str = ""):
     from core.models import AgentRun
 
     return AgentRun.objects.create(
         user=user,
         thread_id=uuid.UUID(str(thread_id)),
         task=task,
+        repo_url=repo_url,
     )
+
+
+def record_run_outcome(thread_id: str, payload: dict | None = None, error: str = ""):
+    """Persist the latest status of a run so it shows up in run history."""
+    from core.models import AgentRun
+
+    try:
+        run = AgentRun.objects.get(thread_id=uuid.UUID(str(thread_id)))
+    except (AgentRun.DoesNotExist, ValueError):
+        return
+
+    if error:
+        run.status = "error"
+        run.summary = error[:2000]
+    elif payload:
+        run.status = payload.get("status", run.status)
+        if payload.get("pr_url"):
+            run.pr_url = payload["pr_url"]
+        # A failure reason is more useful in history than the last tool output.
+        text = payload.get("error") or payload.get("final_result") or ""
+        if text:
+            run.summary = text[:2000]
+
+    run.save()
+
+
+def get_pending_approval(thread_id: str):
+    """
+    Return the approval request a paused run is waiting on, or None.
+    Lets the UI re-open an approval after a page reload.
+    """
+    try:
+        snapshot = agent.get_state({"configurable": {"thread_id": str(thread_id)}})
+
+        for task in snapshot.tasks:
+            for interrupt_ in getattr(task, "interrupts", ()):
+                return interrupt_.value
+
+    except Exception:
+        return None
+
+    return None
 
 
 def validate_owned_thread(user, thread_id: str) -> str:
@@ -147,6 +192,11 @@ def _initial_state(
         "debug_result": "",
         "final_result": "",
         "failed_file": "",
+        "commit_result": "",
+        "push_approval": "",
+        "push_result": "",
+        "pr_url": "",
+        "pr_result": "",
         "workspace_path": workspace_path,
         "agent_steps": 0,
         "debug_attempts": 0,
@@ -246,6 +296,19 @@ def _serialize_messages(messages) -> list:
     return serialized
 
 
+def _failure_message(text) -> str:
+    """Extract the 'message' from a stringified tool result dict."""
+    import ast
+
+    try:
+        data = ast.literal_eval(str(text))
+        if isinstance(data, dict):
+            return str(data.get("message", "")) or str(text)
+    except (ValueError, SyntaxError):
+        pass
+    return str(text)
+
+
 def serialize_result(result: dict) -> dict:
     interrupts = result.get("__interrupt__")
 
@@ -260,7 +323,41 @@ def serialize_result(result: dict) -> dict:
         "",
     )
 
-    if (
+    branch_result = result.get("branch_result", "")
+
+    # A failed branch step used to end the run silently ("Could not complete"
+    # with no reason). Report it as an error with the actual message.
+    if isinstance(branch_result, str) and branch_result.startswith("error:"):
+        return {
+            "status": "error",
+            "error": "Could not create the agent branch. " + branch_result[6:].strip(),
+            "final_result": "",
+            "test_result": "",
+            "debug_result": "",
+            "commit_result": "",
+            "push_result": "",
+            "pr_url": "",
+            "branch_result": branch_result,
+            "messages": _serialize_messages(result.get("messages", [])),
+        }
+
+    push_result = str(result.get("push_result", ""))
+    pr_result = str(result.get("pr_result", ""))
+    delivery_error = ""
+
+    if "'status': 'error'" in push_result:
+        # Committed locally, but the branch never reached GitHub.
+        status = "push_failed"
+        delivery_error = "Push failed: " + _failure_message(push_result)
+
+    elif "'status': 'error'" in pr_result:
+        status = "pr_failed"
+        delivery_error = (
+            "The branch was pushed, but the pull request could not be created: "
+            + _failure_message(pr_result)
+        )
+
+    elif (
         isinstance(final_result, str)
         and final_result.startswith(
             "Human rejected the proposed change."
@@ -275,6 +372,14 @@ def serialize_result(result: dict) -> dict:
         )
     ):
         status = "completed"
+
+    elif (
+        "'status': 'failed'" in str(result.get("test_result", ""))
+        or "'status': 'error'" in str(result.get("test_result", ""))
+    ):
+        # The run ended without a passing test, so nothing was committed
+        # or pushed. Do not report that as "completed".
+        status = "tests_failed"
 
     elif final_result:
         status = "completed"
@@ -293,6 +398,12 @@ def serialize_result(result: dict) -> dict:
             "debug_result",
             "",
         ),
+        "commit_result": result.get("commit_result", ""),
+        "push_result": result.get("push_result", ""),
+        "pr_url": result.get("pr_url", ""),
+        "branch_result": branch_result,
+        "pr_result": pr_result,
+        "error": delivery_error,
         "messages": _serialize_messages(
             result.get(
                 "messages",

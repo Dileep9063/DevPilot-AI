@@ -1,0 +1,61 @@
+# DevPilot AI — production-style stack: PostgreSQL + Django (gunicorn) + React (nginx)
+#
+#   1. cp .env.example .env      (fill in secrets)
+#   2. docker compose up -d --build
+#   3. open http://localhost:8080
+#
+# Postgres holds both the Django tables and the LangGraph checkpoints
+# (their table names do not collide), so only one database is needed.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: devpilot
+      POSTGRES_USER: devpilot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devpilot -d devpilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DJANGO_DEBUG: "False"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
+      DJANGO_DB_HOST: db
+      DJANGO_DB_NAME: devpilot
+      DJANGO_DB_USER: devpilot
+      DJANGO_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      LANGGRAPH_POSTGRES_URI: postgresql://devpilot:${POSTGRES_PASSWORD}@db:5432/devpilot
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - workspace:/data/workspace
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  pgdata:
+  workspace:

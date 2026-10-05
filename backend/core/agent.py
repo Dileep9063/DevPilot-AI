@@ -19,12 +19,6 @@ from langchain_core.messages import (
     SystemMessage,
 )
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import (
-    ChatHuggingFace,
-    HuggingFaceEndpoint,
-)
-from langchain_openai import ChatOpenAI
 
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
@@ -52,8 +46,12 @@ from core.tools import (
     write_file,
     write_new_file,
     run_tests,
+    git_commit,
+    git_push,
+    create_pull_request,
     set_workspace,
     reset_workspace,
+    safe_workspace_path,
 )
 
 
@@ -105,6 +103,13 @@ class AgentState(TypedDict):
     # Failure information
     failed_file: str
 
+    # Delivery (commit / push / pull request)
+    commit_result: str
+    push_approval: str
+    push_result: str
+    pr_url: str
+    pr_result: str
+
     # Workspace used by this run
     workspace_path: str
 
@@ -114,108 +119,23 @@ class AgentState(TypedDict):
 
 
 # ============================================================
-# 3. LLM PROVIDERS
-# ============================================================
-
-# Gemini
+# 3-5. LLM PROVIDERS, ERROR DETECTION AND FALLBACK
 #
-# Kept available for future provider switching/fallback.
+# See core/llm_providers.py. Providers (OpenRouter, Gemini,
+# Hugging Face) are built from environment variables and tried in
+# LLM_PROVIDER_ORDER; rate limits / outages fall through to the
+# next provider automatically.
+# ============================================================
 
-gemini_llm = ChatGoogleGenerativeAI(
-    model="gemini-3.8-flash"
+from core.llm_providers import (
+    is_transient_provider_error,
+    invoke_with_fallback,
 )
 
-
-# Hugging Face
-#
-# Kept available for future provider switching/fallback.
-
-hf_llm = ChatHuggingFace(
-    llm=HuggingFaceEndpoint(
-        repo_id="openai/gpt-oss-120b",
-        task="text-generation",
-        huggingfacehub_api_token=os.environ["HF_TOKEN"],
-        max_new_tokens=1000,
-    )
-)
-
-
-# OpenRouter
-
-openrouter_llm = ChatOpenAI(
-    model="openrouter/free",
-    api_key=os.environ["OPENROUTER_API_KEY"],
-    base_url="https://openrouter.ai/api/v1",
-)
-
-
-# Current primary provider
-
-PRIMARY_LLM = openrouter_llm
-
-
-# ============================================================
-# 4. PROVIDER ERROR DETECTION
-# ============================================================
-
-def is_transient_provider_error(exc: Exception) -> bool:
-    """
-    Return True when the provider appears temporarily unavailable,
-    rate-limited, or overloaded.
-    """
-
-    message = str(exc).lower()
-
-    transient_markers = (
-        "429",
-        "rate limit",
-        "too many requests",
-        "503",
-        "service unavailable",
-        "unavailable",
-        "temporarily unavailable",
-        "high demand",
-        "timeout",
-    )
-
-    return any(
-        marker in message
-        for marker in transient_markers
-    )
-
-
-# ============================================================
-# 5. LLM INVOCATION
-# ============================================================
 
 def invoke_llm(messages, tools=None):
-    """
-    Invoke the current primary LLM.
-
-    OpenRouter is currently used as the primary provider because
-    Gemini free-tier quota may be exhausted.
-
-    Provider fallback can be added later without changing the
-    LangGraph workflow.
-    """
-
-    llm = PRIMARY_LLM
-
-    if tools:
-        llm = llm.bind_tools(tools)
-
-    try:
-
-        return llm.invoke(messages)
-
-    except Exception as exc:
-
-        print(
-            "LLM ERROR:",
-            repr(exc)
-        )
-
-        raise
+    """Invoke the configured LLM providers with automatic fallback."""
+    return invoke_with_fallback(messages, tools)
 
 
 # ============================================================
@@ -263,6 +183,11 @@ Use this to find relevant:
 - tests
 - documentation
 - symbols
+
+Results are ranked by relevance and include line numbers and
+snippets. Files that DEFINE a matching function/class rank
+highest. Prefer one specific query (an identifier or filename)
+over many broad ones.
 
 Use targeted searches.
 
@@ -961,7 +886,23 @@ def approval_node(
             "approval": state["approval"]
         }
 
+    # Original content lets the UI render a real diff (read-only, no side effects).
+    original_content = ""
+    _token = set_workspace(state.get("workspace_path", "workspace"))
+    try:
+        _target = safe_workspace_path(proposed_path)
+        if _target is not None and _target.is_file():
+            original_content = _target.read_text(encoding="utf-8", errors="ignore")
+    finally:
+        reset_workspace(_token)
+
     decision = interrupt({
+
+        "type":
+            "code_change",
+
+        "original_content":
+            original_content,
 
         "question":
             "Do you approve this code change?",
@@ -1237,6 +1178,124 @@ def test_node(
 
 
 # ============================================================
+# 19b. DELIVERY: COMMIT -> PUSH APPROVAL -> PUSH -> PULL REQUEST
+#
+# Commit is local and safe (agent branch only). Push and PR leave
+# the machine, so they require a SECOND human approval.
+# ============================================================
+
+def _commit_message(state: AgentState) -> str:
+    task = " ".join(state.get("task", "").split())[:60] or "automated change"
+    return f"DevPilot: {task}"
+
+
+def commit_node(state: AgentState):
+
+    token = set_workspace(state.get("workspace_path", "workspace"))
+
+    try:
+        result = git_commit.invoke({"message": _commit_message(state)})
+        return {"commit_result": str(result)}
+
+    finally:
+        reset_workspace(token)
+
+
+def route_after_commit(state: AgentState):
+
+    if "'status': 'success'" in state.get("commit_result", ""):
+        return "push_approval"
+
+    return END
+
+
+def push_approval_node(state: AgentState):
+    # NOTE: interrupt() re-runs this node on resume, so it must stay free
+    # of side effects.
+
+    tested = "'status': 'passed'" in state.get("test_result", "")
+
+    decision = interrupt({
+        "type": "push_approval",
+        "question": "Push this branch and open a pull request?",
+        "tests": "passed" if tested else "no_tests",
+        "message": (
+            "Tests passed and changes are committed locally. "
+            "Approve to push the branch and open a pull request."
+            if tested
+            else "No automated tests were found, so this change is NOT verified. "
+            "It is committed locally. Approve to push the branch and open a "
+            "pull request, then review it carefully on GitHub."
+        ),
+        "commit": state.get("commit_result", ""),
+        "branch": state.get("branch_result", ""),
+    })
+
+    return {"push_approval": decision}
+
+
+def route_after_push_approval(state: AgentState):
+
+    if state.get("push_approval") == "approve":
+        return "push"
+
+    return END
+
+
+def push_node(state: AgentState):
+
+    token = set_workspace(state.get("workspace_path", "workspace"))
+
+    try:
+        result = git_push.invoke({})
+        return {"push_result": str(result)}
+
+    finally:
+        reset_workspace(token)
+
+
+def route_after_push(state: AgentState):
+
+    if "'status': 'success'" in state.get("push_result", ""):
+        return "pull_request"
+
+    return END
+
+
+def pull_request_node(state: AgentState):
+
+    token = set_workspace(state.get("workspace_path", "workspace"))
+
+    try:
+        task = state.get("task", "")
+        result = create_pull_request.invoke({
+            "title": _commit_message(state),
+            "body": (
+                "Automated change proposed by DevPilot AI.\n\n"
+                f"**Task:** {task}\n\n"
+                + (
+                    "Tests passed before this branch was pushed. "
+                    if "'status': 'passed'" in state.get("test_result", "")
+                    else "**No automated tests were found, so this change is not "
+                    "verified.** "
+                )
+                + "Please review before merging."
+            ),
+        })
+
+        pr_url = result.get("url", "") if isinstance(result, dict) else ""
+
+        return {
+            "pr_url": pr_url,
+            "pr_result": str(result),
+            "final_result": f"{state.get('final_result', '')}\nPR: {result}",
+        }
+
+    finally:
+        reset_workspace(token)
+
+
+# ============================================================
 # 20. TEST RESULT ROUTING
 # ============================================================
 
@@ -1249,9 +1308,14 @@ def route_after_test(
         ""
     )
 
-    if "'status': 'passed'" in test_result:
+    # "no_tests" means there was nothing to run (e.g. a new repo). That must
+    # not block delivery; the push approval warns that nothing was verified.
+    if (
+        "'status': 'passed'" in test_result
+        or "'status': 'no_tests'" in test_result
+    ):
 
-        return "done"
+        return "commit"
 
     return "debug"
 
@@ -2059,8 +2123,8 @@ graph_builder.add_conditional_edges(
     "test",
     route_after_test,
     {
-        "done":
-            END,
+        "commit":
+            "commit",
 
         "debug":
             "debug",
@@ -2105,6 +2169,26 @@ graph_builder.add_conditional_edges(
 )
 
 
+graph_builder.add_node("commit", commit_node)
+graph_builder.add_node("push_approval", push_approval_node)
+graph_builder.add_node("push", push_node)
+graph_builder.add_node("pull_request", pull_request_node)
+
+graph_builder.add_conditional_edges(
+    "commit", route_after_commit,
+    {"push_approval": "push_approval", END: END},
+)
+graph_builder.add_conditional_edges(
+    "push_approval", route_after_push_approval,
+    {"push": "push", END: END},
+)
+graph_builder.add_conditional_edges(
+    "push", route_after_push,
+    {"pull_request": "pull_request", END: END},
+)
+graph_builder.add_edge("pull_request", END)
+
+
 # ============================================================
 # 39. CHECKPOINTER
 # ============================================================
@@ -2138,6 +2222,9 @@ def create_checkpointer():
     checkpointer = PostgresSaver(
         pool
     )
+
+    # Idempotent: creates the checkpoint tables on a fresh database.
+    checkpointer.setup()
 
     return (
         pool,
@@ -2249,7 +2336,9 @@ Git safety:
 - The LLM cannot directly create branches.
 - Main/master cannot be used by create_agent_branch().
 - The branch is created only after human approval.
-- Current version does NOT commit or push yet.
+- Commit happens on the agent branch after tests pass.
+- Push + PR require a second human approval (push_approval).
+- main/master can never be committed to or pushed.
 
 
 Safety limits:

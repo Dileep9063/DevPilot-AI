@@ -115,7 +115,7 @@ Mapped to your checklist:
    `core/tools.py` by clearing `__pycache__` and disabling bytecode
    writing before every test run.
 
-## Setup
+## Setup (local development)
 
 ### Backend
 ```bash
@@ -123,98 +123,127 @@ cd backend
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env              # then put your real GEMINI_API_KEY in .env
+cp .env.example .env              # then fill in your keys (see below)
 python manage.py migrate
 python manage.py runserver
 ```
+
+`backend/.env` needs at least:
+
+| Variable | Purpose |
+|---|---|
+| `OPENROUTER_API_KEY` / `GEMINI_API_KEY` / `HF_TOKEN` | LLM providers — set one or more |
+| `LANGGRAPH_POSTGRES_URI` | PostgreSQL for resumable run checkpoints (tables are created automatically) |
+| `GITHUB_TOKEN` | Fine-grained token: Contents + Pull requests (read/write) |
+| `DJANGO_SECRET_KEY`, `DJANGO_DEBUG` | Standard Django settings |
 
 ### Frontend
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev                        # http://localhost:5173
 ```
+
+## How a run works
+
+```
+explore repo -> propose change -> [you approve the diff] -> agent branch
+  -> write file -> run tests -> (fail: debug -> propose fix -> approve -> retry)
+  -> commit -> [you approve the push] -> push branch -> open pull request
+```
+
+- Two human approvals: one for every file change, one before anything
+  leaves your machine (push + PR).
+- Commits and pushes to `main`/`master` are refused.
+- Run history (`GET /api/agent/runs/`) lets you reopen a paused run and
+  continue its approval after a page reload.
+
+### LLM provider fallback
+
+Providers are tried in `LLM_PROVIDER_ORDER` (default
+`openrouter,gemini,huggingface`). A provider without a key is skipped.
+Rate limits / outages are retried once (`LLM_RETRIES`), then the next
+provider is used. If all fail, the error lists every provider's failure.
+Models can be overridden with `OPENROUTER_MODEL`, `GEMINI_MODEL`,
+`HF_REPO_ID`.
+
+### Code search
+
+`search_code` ranks files (BM25-style keyword scoring, camelCase/snake_case
+aware, boosts files that *define* the thing searched for) and returns line
+numbers + snippets. `read_file` accepts `start_line`/`end_line` for large
+files. This is keyword retrieval, not embeddings.
+
+## API
+
+All endpoints except register/login need `Authorization: Bearer <access>`.
+
+| Method | Path | |
+|---|---|---|
+| POST | `/api/auth/register/`, `/api/auth/login/`, `/api/auth/refresh/` | JWT auth |
+| POST | `/api/agent/run/` | `{repo_url, task}` -> result or `waiting_for_approval` |
+| POST | `/api/agent/resume/` | `{thread_id, decision: "approve"\|"reject"}` |
+| GET | `/api/agent/runs/` | your recent runs |
+| GET | `/api/agent/runs/<thread_id>/` | one run (+ pending approval if paused) |
 
 ## Testing
 
-Automated (no Gemini key needed — deterministic graph logic, sandboxed
-tools, and endpoint validation only):
 ```bash
 cd backend
-python manage.py test core
+python manage.py test core          # Django tests (needs the Postgres from LANGGRAPH_POSTGRES_URI)
+python -m pytest core/test_git_delivery.py core/test_llm_fallback.py core/test_code_search.py
+cd ../frontend && npm run lint && npm run build
 ```
 
-Manual, full end-to-end with a real model (needs `GEMINI_API_KEY` in `.env`):
+`FullGraphDeliveryTests` drives the real compiled graph without an LLM
+(approve -> test -> commit -> approve push -> push -> PR) against a local
+bare git remote, so the delivery pipeline is covered offline. Anything
+that needs a real model is left for manual end-to-end testing.
+
+## Deployment (Docker)
+
 ```bash
-cd backend
-python -m core.run_agent
+cp .env.example .env               # fill in secrets
+docker compose up -d --build
+# UI:  http://localhost:8080      API: http://localhost:8000
 ```
-Or drive it over HTTP once `runserver` is up:
+
+- `db` (PostgreSQL 16) holds both Django tables and LangGraph checkpoints.
+- `backend` runs migrations, collects static files, then gunicorn
+  (long timeout: agent runs are synchronous).
+- `frontend` is the built React app behind nginx. `VITE_API_URL` is baked
+  in at build time and must be reachable from the **browser**.
+- For a real domain, set `VITE_API_URL`, `DJANGO_ALLOWED_HOSTS`,
+  `CORS_ALLOWED_ORIGINS` and `CSRF_TRUSTED_ORIGINS` in `.env`, and put a
+  TLS-terminating reverse proxy (Caddy, nginx, a cloud load balancer) in front.
+
+### Housekeeping
+
+Cloned repositories accumulate in `workspace/runs/`. Remove finished runs
+older than 7 days (paused runs are kept):
+
 ```bash
-curl -X POST http://127.0.0.1:8000/api/agent/run/ \
-  -H "Content-Type: application/json" \
-  -d '{"task": "Fix the login bug in auth.py"}'
-
-curl -X POST http://127.0.0.1:8000/api/agent/resume/ \
-  -H "Content-Type: application/json" \
-  -d '{"thread_id": "<from previous response>", "decision": "approve"}'
+python manage.py cleanup_workspaces --days 7 --dry-run   # preview
+python manage.py cleanup_workspaces --days 7
+# Docker: docker compose exec backend python manage.py cleanup_workspaces --days 7
 ```
 
-## ⚠️ Security note
+## ⚠️ Security notes
 
-The uploaded `.env` contained a live Gemini API key. Treat it as
-exposed and **rotate it** in Google AI Studio, then put the new key
-in `backend/.env` (never `.env.example`, and never commit `.env` —
-it's already in `.gitignore`).
+- **Rotate any API key that was ever committed or shared**, and keep real
+  keys only in `.env` (git-ignored).
+- The agent clones a repository and runs its tests (`pytest` / `npm test`).
+  **That is arbitrary code execution.** Mitigations in place: the test
+  process does not receive DevPilot's secrets (keys, tokens, DB URIs),
+  the Docker backend runs as a non-root user, and nothing is pushed
+  without your approval. It is **not** a full sandbox — only point
+  DevPilot at repositories you trust, and run it on an isolated machine.
+  Per-run containers with no network access would be the next hardening step.
+- Use a fine-grained GitHub token limited to the repositories you test on.
 
-## Known limitations / good next steps
+## Known limitations / next steps
 
-- The LangGraph checkpointer is `InMemorySaver` — runs are lost on
-  server restart and won't work across multiple worker processes.
-  Fine for local dev; swap for `SqliteSaver`/`PostgresSaver` before
-  deploying for real.
-- The frontend (`App.jsx`) only calls `/api/ai/chat/` — it hasn't been
-  wired to the new `/api/agent/run/` and `/api/agent/resume/`
-  endpoints yet (out of scope here since you asked specifically for
-  the backend).
-
-
-## Current project status
-
-The core portfolio MVP is implemented:
-
-- React frontend with authentication and agent controls
-- Django REST API with JWT authentication
-- LangGraph orchestration
-- Gemini as the primary LLM with Hugging Face fallback for transient provider failures
-- Tool calling for workspace inspection and controlled code changes
-- Human-in-the-loop approval before file writes
-- Real pytest execution after changes
-- Automatic failure detection and AI-assisted debug/fix flow
-- A second human approval checkpoint for AI-generated fixes
-- PostgreSQL LangGraph checkpoint persistence
-- Per-user agent thread ownership checks
-- Workspace path traversal protection
-- Automated Django tests for deterministic agent behavior and API validation
-
-The main engineering story is that DevPilot is not only a code generator. It follows an inspect -> propose -> approve -> modify -> test -> debug -> approve -> retry workflow, with persistent state and controlled tools.
-
-## Final local verification
-
-Because API credentials and the local PostgreSQL service are intentionally not stored in Git, run the following once on the development machine:
-
-```powershell
-cd C:\DevPilot-AI\backend
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python manage.py test
-python -c "import core.agent; print('agent imported successfully')"
-
-cd ..\frontend
-npm install
-npm run build
-```
-
-Then start PostgreSQL and Django and test one real task from the UI.
-
-`backend/.env.example` contains the required environment variable names. Never commit the real `.env` or API tokens.
+- Runs are synchronous: the HTTP request stays open while the agent
+  works. Streaming progress or a background worker would improve UX.
+- Retrieval is keyword-based; embeddings could be added for large repos.
+- No fork workflow: pushing requires write access to the target repository.

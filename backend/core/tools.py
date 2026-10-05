@@ -5,6 +5,11 @@ from langchain_core.tools import tool
 import os
 import subprocess
 import sys
+import base64
+import re
+import requests
+
+_NPM = "npm.cmd" if os.name == "nt" else "npm"
 
 
 # ============================================================
@@ -36,6 +41,72 @@ def get_workspace():
 
 # Backward-compatible name used by tests and existing code.
 WORKSPACE = DEFAULT_WORKSPACE
+
+
+# ============================================================
+# GIT HELPERS
+# ============================================================
+
+def _git(args, cwd, timeout=60):
+    """Run a git command; raises CalledProcessError on failure. Returns stdout."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _current_branch(cwd) -> str:
+    """
+    Name of the checked-out branch. Works on repositories that have no
+    commits yet (unborn HEAD), where `rev-parse --abbrev-ref HEAD` fails.
+    """
+    try:
+        return _git(["symbolic-ref", "--short", "HEAD"], cwd)
+    except subprocess.CalledProcessError:
+        return _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)  # detached HEAD
+
+
+def _parse_github_remote(url: str):
+    """Return (owner, repo) from a GitHub https/ssh remote URL, else None."""
+    m = re.match(
+        r"^(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:)"
+        r"([^/]+)/([^/]+?)(?:\.git)?/?$",
+        url.strip(),
+    )
+    return m.groups() if m else None
+
+
+def _redact(text: str) -> str:
+    token = os.environ.get("GITHUB_TOKEN", "")
+    return text.replace(token, "***") if token else text
+
+
+PROTECTED_BRANCHES = {"main", "master"}
+
+
+_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "URI", "DATABASE_URL")
+
+
+def _sanitized_env():
+    """
+    Environment for running a cloned repository's tests.
+
+    Strips anything that looks like a secret (API keys, GITHUB_TOKEN,
+    DB URIs) so untrusted repo code cannot read DevPilot's credentials.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not any(m in k.upper() for m in _SECRET_MARKERS)
+    }
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["CI"] = "true"  # keep npm test runners out of watch mode
+    return env
 
 
 # ============================================================
@@ -131,11 +202,163 @@ def _iter_source_files(root):
 # SEARCH CODE
 # ============================================================
 
+MAX_SEARCH_FILE_BYTES = 500_000
+MAX_SEARCH_FILES = 5000
+MAX_RESULTS = 10
+SNIPPETS_PER_FILE = 3
+
+_DEFINITION_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+    r"(?:def|class|function|const|let|var|interface|type|struct|fn|func)\s+(\w+)"
+)
+
+
+SUBWORD_WEIGHT = 0.35
+
+
+def _tokenize(text: str):
+    """
+    Return {token: weight}.
+
+    The whole identifier (e.g. "diffview", "create_pull_request") has
+    weight 1.0. Its snake_case/camelCase sub-words are also searched
+    but weigh less, so "DiffView" does not match every file about "view".
+    """
+    weights = {}
+    for word in re.findall(r"[A-Za-z0-9_]+", text):
+        whole = word.lower().replace("_", "")
+        parts = [
+            p.lower()
+            for p in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", word)
+        ]
+        full = word.lower()
+        if len(full) > 1:
+            weights[full] = max(weights.get(full, 0), 1.0)
+        for p in parts:
+            if len(p) > 1 and p != full:
+                w = 1.0 if len(parts) == 1 else SUBWORD_WEIGHT
+                weights[p] = max(weights.get(p, 0), w)
+    return weights
+
+
+def rank_code_search(workspace, query: str):
+    """
+    Rank files for a query (BM25-style keyword scoring).
+
+    Signals: term frequency (saturating), rarity of the term across the
+    repo (IDF), matches in the file path, matches on definition lines
+    (def/class/function/...), and an exact whole-query substring bonus.
+    """
+    import math
+
+    workspace = Path(workspace)
+    weights = _tokenize(query)
+    terms = list(weights)
+    phrase = query.strip().lower()
+
+    if not terms:
+        return []
+
+    docs = []
+
+    for count, file_path in enumerate(_iter_source_files(workspace)):
+        if count >= MAX_SEARCH_FILES:
+            break
+        try:
+            if file_path.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                continue
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        rel = str(file_path.relative_to(workspace)).replace("\\", "/")
+        lines = text.splitlines()
+        lower_lines = [ln.lower() for ln in lines]
+        joined = "\n".join(lower_lines)
+
+        tf = {t: joined.count(t) for t in terms}
+        path_l = rel.lower()
+        path_hits = sum(weights[t] for t in terms if t in path_l)
+
+        if not any(tf.values()) and not path_hits:
+            continue
+
+        docs.append((rel, lines, lower_lines, tf, path_hits, phrase in joined))
+
+    if not docs:
+        return []
+
+    n_docs = len(docs)
+    df = {t: sum(1 for d in docs if d[3][t] > 0) for t in terms}
+    avg_len = sum(len(d[1]) for d in docs) / n_docs or 1
+
+    results = []
+
+    for rel, lines, lower_lines, tf, path_hits, has_phrase in docs:
+        k1, b = 1.4, 0.75
+        score = 0.0
+
+        for t in terms:
+            if tf[t] == 0:
+                continue
+            idf = math.log(1 + (n_docs - df[t] + 0.5) / (df[t] + 0.5))
+            norm = tf[t] * (k1 + 1) / (
+                tf[t] + k1 * (1 - b + b * len(lines) / avg_len)
+            )
+            score += weights[t] * idf * norm
+
+        score += 3.0 * path_hits
+
+        # Filename equals the query (e.g. "auth" -> auth.py): strong signal.
+        stem = Path(rel).stem.lower()
+        if weights.get(stem, 0) >= 1.0:
+            score += 8.0
+        if has_phrase:
+            score += 4.0
+
+        # Score each line; keep the best few as snippets.
+        line_scores = []
+        definitions = 0
+        for i, low in enumerate(lower_lines):
+            hit = sum(weights[t] for t in terms if t in low)
+            if not hit:
+                continue
+            ls = hit
+            m = _DEFINITION_RE.match(lines[i])
+            if m and any(
+                weights[t] >= 1.0 and t in m.group(1).lower() for t in terms
+            ):
+                ls += 3
+                definitions += 1
+            line_scores.append((ls, i))
+
+        # A file that DEFINES the thing outranks files that merely use it.
+        score += min(definitions, 2) * 8.0
+
+        line_scores.sort(key=lambda x: (-x[0], x[1]))
+        snippets = [
+            {"line": i + 1, "text": lines[i].strip()[:200]}
+            for _, i in sorted(line_scores[:SNIPPETS_PER_FILE], key=lambda x: x[1])
+        ]
+
+        if not snippets and lines:
+            snippets = [{"line": 1, "text": lines[0].strip()[:200]}]
+
+        results.append({"path": rel, "score": round(score, 2), "snippets": snippets})
+
+    results.sort(key=lambda r: (-r["score"], r["path"]))
+    return results[:MAX_RESULTS]
+
+
 @tool
 def search_code(query: str):
     """
-    Search relevant source/config files while ignoring
-    dependencies and generated files.
+    Search the repository for relevant code and return the best-matching
+    files, ranked by relevance, each with line numbers and snippets.
+
+    Works with natural phrases, identifiers (camelCase / snake_case are
+    split automatically) and filenames. Files that DEFINE a matching
+    function/class rank higher than files that merely mention it.
     """
 
     workspace = get_workspace()
@@ -156,34 +379,16 @@ def search_code(query: str):
                 "Search query cannot be empty."
         }
 
-    results = []
-
-    for file_path in _iter_source_files(workspace):
-
-        try:
-
-            content = file_path.read_text(
-                encoding="utf-8",
-                errors="ignore"
-            )
-
-            if query.lower() in content.lower():
-
-                results.append(
-                    str(
-                        file_path.relative_to(
-                            workspace
-                        )
-                    )
-                )
-
-        except Exception:
-
-            continue
+    results = rank_code_search(workspace, query)
 
     return {
         "query": query,
-        "matches": results
+
+        # Ranked file paths (kept for backward compatibility).
+        "matches": [r["path"] for r in results],
+
+        # Same files with scores and line snippets.
+        "results": results,
     }
 
 
@@ -192,9 +397,17 @@ def search_code(query: str):
 # ============================================================
 
 @tool
-def read_file(path: str):
+def read_file(
+    path: str,
+    start_line: int = 0,
+    end_line: int = 0
+):
     """
-    Read the contents of a file inside the workspace.
+    Read a file inside the workspace.
+
+    Optionally pass start_line / end_line (1-based, inclusive) to read
+    only part of a large file. Use the line numbers returned by
+    search_code. Omit both to read the whole file.
     """
 
     file_path = safe_workspace_path(path)
@@ -226,6 +439,29 @@ def read_file(path: str):
             encoding="utf-8",
             errors="ignore"
         )
+
+        if start_line or end_line:
+
+            lines = content.splitlines(keepends=True)
+            total = len(lines)
+
+            start = max(1, int(start_line or 1))
+            end = min(total, int(end_line or total))
+
+            if start > end:
+
+                return {
+                    "error":
+                        f"Invalid range: file has {total} lines."
+                }
+
+            return {
+                "path": path,
+                "content": "".join(lines[start - 1:end]),
+                "start_line": start,
+                "end_line": end,
+                "total_lines": total,
+            }
 
         return {
             "path":
@@ -706,58 +942,6 @@ def git_status():
             "message": str(exc),
         }
 @tool
-def git_status():
-    """
-    Return the current Git working-tree status
-    for the active workspace.
-    """
-
-    workspace = get_workspace()
-
-    if workspace is None:
-        return {
-            "status": "error",
-            "message": "Workspace is not initialized."
-        }
-
-    try:
-        result = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-
-        return {
-            "status": "success",
-            "changes": result.stdout.strip(),
-        }
-
-    except subprocess.CalledProcessError as exc:
-        return {
-            "status": "error",
-            "message": (
-                exc.stderr.strip()
-                or exc.stdout.strip()
-                or "Unable to read Git status."
-            ),
-        }
-
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "error",
-            "message": "Git status timed out."
-        }
-
-    except Exception as exc:
-        return {
-            "status": "error",
-            "message": str(exc),
-        }
-
-@tool
 def create_agent_branch(branch_name: str):
     """
     Create and switch to a dedicated Git branch
@@ -785,27 +969,27 @@ def create_agent_branch(branch_name: str):
         }
 
     try:
-        result = subprocess.run(
-            [
-                "git",
-                "checkout",
-                "-b",
-                branch_name,
-            ],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
+        current = _current_branch(workspace)
+
+        # Debug retries re-enter this tool; stay on the branch if already there.
+        if current == branch_name:
+            return {
+                "status": "success",
+                "branch": branch_name,
+                "message": f"Already on branch '{branch_name}'.",
+            }
+
+        exists = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+            cwd=workspace, capture_output=True, text=True, timeout=30,
+        ).returncode == 0
+
+        _git(["checkout"] + ([] if exists else ["-b"]) + [branch_name], workspace)
 
         return {
             "status": "success",
             "branch": branch_name,
-            "message": (
-                result.stdout.strip()
-                or f"Created and switched to branch '{branch_name}'."
-            ),
+            "message": f"Switched to branch '{branch_name}'.",
         }
 
     except subprocess.CalledProcessError as exc:
@@ -819,16 +1003,181 @@ def create_agent_branch(branch_name: str):
         }
 
     except subprocess.TimeoutExpired:
-        return {
-            "status": "error",
-            "message": "Git branch creation timed out."
-        }
+        return {"status": "error", "message": "Git branch creation timed out."}
 
     except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+# ============================================================
+# GIT COMMIT / PUSH / PULL REQUEST
+#
+# These are called ONLY by LangGraph nodes (never bound to the LLM).
+# ============================================================
+
+@tool
+def git_commit(message: str):
+    """Stage all workspace changes and commit them on the current branch."""
+
+    workspace = get_workspace()
+
+    if not message or not message.strip():
+        return {"status": "error", "message": "Commit message is required."}
+
+    try:
+        branch = _current_branch(workspace)
+
+        if branch in PROTECTED_BRANCHES:
+            return {
+                "status": "error",
+                "message": f"Refusing to commit directly to '{branch}'.",
+            }
+
+        _git(["add", "-A"], workspace)
+
+        if not _git(["status", "--porcelain"], workspace):
+            return {"status": "nothing_to_commit", "branch": branch}
+
+        _git(
+            [
+                "-c", "user.name=DevPilot AI",
+                "-c", "user.email=devpilot-ai@users.noreply.github.com",
+                "commit", "-m", message.strip(),
+            ],
+            workspace,
+        )
+
+        return {
+            "status": "success",
+            "branch": branch,
+            "commit": _git(["rev-parse", "--short", "HEAD"], workspace),
+            "files": _git(
+                ["show", "--name-only", "--pretty=format:", "HEAD"], workspace
+            ).splitlines(),
+        }
+
+    except subprocess.CalledProcessError as exc:
         return {
             "status": "error",
-            "message": str(exc),
+            "message": exc.stderr.strip() or exc.stdout.strip() or "Commit failed.",
         }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@tool
+def git_push():
+    """Push the current (non-protected) branch to origin."""
+
+    workspace = get_workspace()
+
+    try:
+        branch = _current_branch(workspace)
+
+        if branch in PROTECTED_BRANCHES:
+            return {
+                "status": "error",
+                "message": f"Refusing to push protected branch '{branch}'.",
+            }
+
+        remote = _git(["remote", "get-url", "origin"], workspace)
+        cmd = ["push", "-u", "origin", branch]
+
+        if _parse_github_remote(remote):
+            token = os.environ.get("GITHUB_TOKEN")
+
+            if not token:
+                return {
+                    "status": "error",
+                    "message": "GITHUB_TOKEN is not set; cannot push to GitHub.",
+                }
+
+            # Token is passed per-command only; it is never written to .git/config.
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            cmd = ["-c", f"http.extraheader=AUTHORIZATION: basic {basic}"] + cmd
+
+        _git(cmd, workspace, timeout=180)
+
+        return {"status": "success", "branch": branch}
+
+    except subprocess.CalledProcessError as exc:
+        return {
+            "status": "error",
+            "message": _redact(
+                exc.stderr.strip() or exc.stdout.strip() or "Push failed."
+            ),
+        }
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "Git push timed out."}
+    except Exception as exc:
+        return {"status": "error", "message": _redact(str(exc))}
+
+
+@tool
+def create_pull_request(title: str, body: str = ""):
+    """Open a GitHub pull request from the current branch into the default branch."""
+
+    workspace = get_workspace()
+    token = os.environ.get("GITHUB_TOKEN")
+
+    if not token:
+        return {"status": "error", "message": "GITHUB_TOKEN is not set."}
+
+    try:
+        head = _current_branch(workspace)
+        parsed = _parse_github_remote(_git(["remote", "get-url", "origin"], workspace))
+
+        if not parsed:
+            return {"status": "error", "message": "origin is not a GitHub remote."}
+
+        owner, repo = parsed
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        api = f"https://api.github.com/repos/{owner}/{repo}"
+
+        info = requests.get(api, headers=headers, timeout=30)
+        info.raise_for_status()
+        base = info.json()["default_branch"]
+
+        if head == base:
+            return {"status": "error", "message": "Head and base branch are the same."}
+
+        resp = requests.post(
+            f"{api}/pulls",
+            headers=headers,
+            json={"title": title, "body": body, "head": head, "base": base},
+            timeout=30,
+        )
+
+        if resp.status_code == 422 and "already exists" in resp.text:
+            existing = requests.get(
+                f"{api}/pulls",
+                headers=headers,
+                params={"head": f"{owner}:{head}", "state": "open"},
+                timeout=30,
+            ).json()
+            if existing:
+                return {
+                    "status": "success",
+                    "url": existing[0]["html_url"],
+                    "number": existing[0]["number"],
+                    "note": "Pull request already existed.",
+                }
+
+        resp.raise_for_status()
+        data = resp.json()
+
+        return {"status": "success", "url": data["html_url"], "number": data["number"]}
+
+    except requests.RequestException as exc:
+        return {"status": "error", "message": _redact(str(exc))}
+    except Exception as exc:
+        return {"status": "error", "message": _redact(str(exc))}
+
+
 # ============================================================
 # WRITE EXISTING FILE
 # ============================================================
@@ -1080,14 +1429,14 @@ def run_tests():
             if "test" in scripts:
 
                 command = [
-                    "npm.cmd",
+                    _NPM,
                     "test"
                 ]
 
             elif "build" in scripts:
 
                 command = [
-                    "npm.cmd",
+                    _NPM,
                     "run",
                     "build"
                 ]
@@ -1096,7 +1445,7 @@ def run_tests():
 
                 return {
                     "status":
-                        "error",
+                        "no_tests",
 
                     "message":
                         "package.json has no test or build script.",
@@ -1122,12 +1471,13 @@ def run_tests():
 
         else:
 
+            # Nothing to run is not a failure: the change is simply unverified.
             return {
                 "status":
-                    "error",
+                    "no_tests",
 
                 "message":
-                    "Could not detect a supported test/build command.",
+                    "No tests were found, so this change was not verified.",
             }
 
         # ----------------------------------------------------
@@ -1140,11 +1490,7 @@ def run_tests():
             capture_output=True,
             text=True,
             timeout=120,
-            env={
-                **os.environ,
-                "PYTHONDONTWRITEBYTECODE":
-                    "1",
-            },
+            env=_sanitized_env(),
         )
 
         return {
