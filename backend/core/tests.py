@@ -31,9 +31,7 @@ from .models import AgentRun, GitHubInstallation
 
 from core.agent import (
     extract_proposal_node,
-    debug_node,
     route_after_test,
-    route_after_debug_fix,
     write_node,
     route_after_commit,
     route_after_push_approval,
@@ -58,6 +56,7 @@ class AgentGraphUnitTests(TestCase):
                 "path": "auth.py",
                 "proposed_content": "def login():\n    pass",
             }),
+            name="propose_file_change",
             tool_call_id="1",
         )
 
@@ -82,38 +81,6 @@ class AgentGraphUnitTests(TestCase):
         self.assertEqual(result["proposed_path"], "")
         self.assertEqual(result["proposed_content"], "")
 
-    def test_debug_node_detects_failure(self):
-        state = {
-            "test_result": "FAILED test_auth.py::test_login - assert False"
-        }
-
-        result = debug_node(state)
-
-        self.assertEqual(
-            result["failed_file"],
-            "test_auth.py",
-        )
-
-        self.assertIn(
-            "failure_detected",
-            result["debug_result"],
-        )
-
-    def test_debug_node_no_failure(self):
-        result = debug_node({
-            "test_result": "1 passed in 0.05s"
-        })
-
-        self.assertEqual(
-            result["failed_file"],
-            "",
-        )
-
-        self.assertEqual(
-            result["debug_result"],
-            "No test failure detected.",
-        )
-
     def test_route_after_test(self):
         self.assertEqual(
             route_after_test({
@@ -126,7 +93,7 @@ class AgentGraphUnitTests(TestCase):
             route_after_test({
                 "test_result": "{'status': 'failed'}"
             }),
-            "debug",
+            "test_failed",
         )
 
         # No tests found must not block delivery; a real error must.
@@ -136,29 +103,7 @@ class AgentGraphUnitTests(TestCase):
         )
         self.assertEqual(
             route_after_test({"test_result": "{'status': 'error'}"}),
-            "debug",
-        )
-
-    def test_route_after_debug_fix_with_proposal(self):
-        state = {
-            "proposed_path": "auth.py",
-            "proposed_content": "code",
-        }
-
-        self.assertEqual(
-            route_after_debug_fix(state),
-            "approval",
-        )
-
-    def test_route_after_debug_fix_without_proposal(self):
-        state = {
-            "proposed_path": "",
-            "proposed_content": "",
-        }
-
-        self.assertEqual(
-            route_after_debug_fix(state),
-            END,
+            "test_failed",
         )
 
     def test_write_node_resets_approval_for_next_hitl_checkpoint(self):
@@ -598,6 +543,18 @@ class FullGraphDeliveryTests(TestCase):
         import subprocess
         import tempfile
 
+        # After every write the agent is consulted again; replying DONE ends the
+        # task phase. Stubbing it keeps these tests offline and deterministic.
+        from unittest import mock
+        from langchain_core.messages import AIMessage
+        import core.agent as agent_module
+
+        llm = mock.patch.object(
+            agent_module, "invoke_llm", return_value=AIMessage(content="DONE")
+        )
+        llm.start()
+        self.addCleanup(llm.stop)
+
         self.tmp = tempfile.mkdtemp(prefix="devpilot_e2e_")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.remote = f"{self.tmp}/remote.git"
@@ -815,6 +772,66 @@ class FullGraphDeliveryTests(TestCase):
         self.assertEqual(payload["status"], "push_failed")
         self.assertIn("no longer installed", payload["error"])
         self.assertEqual(self._remote_branches(), ["main"])
+
+    def test_build_output_created_during_tests_is_not_committed(self):
+        """
+        Regression: `npm run build` created dist/ and `git add -A` put it in the
+        pull request. Only files the agent wrote may be committed.
+        """
+        import os
+        import subprocess
+        from unittest import mock
+        from langchain_core.messages import AIMessage
+        from langgraph.types import Command
+        import core.agent as agent_module
+        from core import agent_service
+
+        # The project's test run creates build output, like `npm run build` does.
+        with open(f"{self.work}/test_calc.py", "w") as f:
+            f.write(
+                "import os\nfrom calc import add\n\n"
+                "def test_add():\n"
+                "    os.makedirs('dist', exist_ok=True)\n"
+                "    open('dist/bundle.js', 'w').write('x')\n"
+                "    assert add(2, 3) == 5\n"
+            )
+
+        def propose(path, content, call_id):
+            return AIMessage(content="", tool_calls=[{
+                "name": "propose_new_file",
+                "args": {"path": path, "content": content},
+                "id": call_id,
+                "type": "tool_call",
+            }])
+
+        replies = [
+            propose("toggle.js", "export const toggle = () => {};\n", "c1"),
+            propose("styles.css", ".dark { color: white; }\n", "c2"),
+            AIMessage(content="DONE added the toggle and its styles."),
+        ]
+
+        thread_id = str(uuid.uuid4())
+        cfg = {"configurable": {"thread_id": thread_id}}
+        init = agent_service._initial_state("Add a dark toggle", self.work, thread_id)
+
+        with mock.patch.object(agent_module, "invoke_llm", side_effect=replies):
+            graph = agent_module.agent
+            first = graph.invoke(init, cfg)["__interrupt__"][0].value
+            second = graph.invoke(Command(resume="approve"), cfg)["__interrupt__"][0].value
+            push_request = graph.invoke(Command(resume="approve"), cfg)["__interrupt__"][0].value
+
+        self.assertEqual((first["path"], second["path"]), ("toggle.js", "styles.css"))
+        self.assertEqual(push_request["type"], "push_approval")
+
+        # The build output really was created in the working tree...
+        self.assertTrue(os.path.exists(f"{self.work}/dist/bundle.js"))
+
+        # ...but the commit holds only the two files the agent wrote.
+        files = subprocess.run(
+            ["git", "show", "--name-only", "--pretty=format:", "HEAD"],
+            cwd=self.work, capture_output=True, text=True,
+        ).stdout.split()
+        self.assertEqual(sorted(files), ["styles.css", "toggle.js"])
 
 
 class CleanupWorkspacesCommandTests(TestCase):
