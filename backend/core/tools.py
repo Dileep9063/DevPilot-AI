@@ -151,6 +151,71 @@ def _sanitized_env():
 # SAFE PATH HANDLING
 # ============================================================
 
+# ============================================================
+# COMMIT ONLY WHAT THE AGENT WROTE
+#
+# Running the project's build/tests creates files such as dist/. They must
+# never end up in the pull request, so write_file / write_new_file record
+# each path (inside .git/, never committed) and git_commit stages just those.
+# ============================================================
+
+BUILD_DIRS = (
+    "dist", "build", "node_modules", ".next", "out", "coverage",
+    "__pycache__", ".pytest_cache", ".venv", "venv",
+)
+
+
+def _written_manifest(workspace):
+    git_dir = Path(workspace) / ".git"
+    return git_dir / "devpilot-written.json" if git_dir.is_dir() else None
+
+
+def _read_written(workspace):
+    import json
+
+    manifest = _written_manifest(workspace)
+    if manifest is None or not manifest.is_file():
+        return []
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        return [p for p in data if isinstance(p, str)]
+    except Exception:
+        return []
+
+
+def _record_written(path):
+    """Remember that the agent wrote `path`. Bookkeeping must never break a write."""
+    import json
+    import posixpath
+
+    try:
+        workspace = get_workspace()
+        manifest = _written_manifest(workspace)
+        if manifest is None:
+            return
+        normalised = posixpath.normpath(str(path).replace("\\", "/"))
+        files = _read_written(workspace)
+        if normalised not in files:
+            files.append(normalised)
+        manifest.write_text(json.dumps(files), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _stage_changes(workspace):
+    written = _read_written(workspace)
+
+    if written:
+        _git(["add", "--", *written], workspace)
+    else:
+        # No record: stage everything except build output.
+        _git(
+            ["add", "-A", "--", ".", *[f":(exclude){d}" for d in BUILD_DIRS]],
+            workspace,
+        )
+
+
+
 def safe_workspace_path(path: str):
     """
     Resolve a path and ensure it stays inside the workspace.
@@ -1071,9 +1136,9 @@ def git_commit(message: str):
                 "message": f"Refusing to commit directly to '{branch}'.",
             }
 
-        _git(["add", "-A"], workspace)
+        _stage_changes(workspace)
 
-        if not _git(["status", "--porcelain"], workspace):
+        if not _git(["diff", "--cached", "--name-only"], workspace):
             return {"status": "nothing_to_commit", "branch": branch}
 
         _git(
@@ -1280,6 +1345,8 @@ def write_file(
             encoding="utf-8"
         )
 
+        _record_written(path)
+
         return {
             "path":
                 path,
@@ -1386,6 +1453,8 @@ def write_new_file(
             content,
             encoding="utf-8"
         )
+
+        _record_written(path)
 
         return {
             "path":
