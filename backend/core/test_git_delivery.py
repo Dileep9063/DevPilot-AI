@@ -76,4 +76,4 @@ def test_push_to_github_remote_without_token_gives_clear_error(repo, monkeypatch
     result = t.git_push.invoke({})
 
     assert result["status"] == "error"
-    assert "GITHUB_TOKEN is not set" in result["message"]
+    assert "No GitHub credentials" in result["message"]

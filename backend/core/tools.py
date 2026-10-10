@@ -44,6 +44,42 @@ WORKSPACE = DEFAULT_WORKSPACE
 
 
 # ============================================================
+# GITHUB TOKEN CONTEXT
+#
+# In GitHub App mode each run gets a short-lived installation token
+# (minted just before it is needed). It lives only in this context
+# variable: never in the graph state, the database or .git/config.
+# Without it, tools fall back to the single GITHUB_TOKEN from .env.
+# ============================================================
+
+_github_token_context = contextvars.ContextVar(
+    "devpilot_github_token",
+    default=None,
+)
+
+
+def set_github_token(token):
+    return _github_token_context.set(token)
+
+
+def reset_github_token(ctx_token):
+    _github_token_context.reset(ctx_token)
+
+
+def get_github_token():
+    return _github_token_context.get() or os.environ.get("GITHUB_TOKEN") or ""
+
+
+def github_auth_args(token: str):
+    """
+    Arguments placed BEFORE the git subcommand (`git -c ... push`), so the
+    credential applies to this one process and is never written to config.
+    """
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return ["-c", f"http.extraheader=AUTHORIZATION: basic {basic}"]
+
+
+# ============================================================
 # GIT HELPERS
 # ============================================================
 
@@ -82,8 +118,10 @@ def _parse_github_remote(url: str):
 
 
 def _redact(text: str) -> str:
-    token = os.environ.get("GITHUB_TOKEN", "")
-    return text.replace(token, "***") if token else text
+    for token in {os.environ.get("GITHUB_TOKEN", ""), _github_token_context.get() or ""}:
+        if token:
+            text = text.replace(token, "***")
+    return text
 
 
 PROTECTED_BRANCHES = {"main", "master"}
@@ -1084,17 +1122,19 @@ def git_push():
         cmd = ["push", "-u", "origin", branch]
 
         if _parse_github_remote(remote):
-            token = os.environ.get("GITHUB_TOKEN")
+            token = get_github_token()
 
             if not token:
                 return {
                     "status": "error",
-                    "message": "GITHUB_TOKEN is not set; cannot push to GitHub.",
+                    "message": (
+                        "No GitHub credentials available: connect your GitHub "
+                        "account, or set GITHUB_TOKEN; cannot push to GitHub."
+                    ),
                 }
 
             # Token is passed per-command only; it is never written to .git/config.
-            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-            cmd = ["-c", f"http.extraheader=AUTHORIZATION: basic {basic}"] + cmd
+            cmd = github_auth_args(token) + cmd
 
         _git(cmd, workspace, timeout=180)
 
@@ -1118,10 +1158,13 @@ def create_pull_request(title: str, body: str = ""):
     """Open a GitHub pull request from the current branch into the default branch."""
 
     workspace = get_workspace()
-    token = os.environ.get("GITHUB_TOKEN")
+    token = get_github_token()
 
     if not token:
-        return {"status": "error", "message": "GITHUB_TOKEN is not set."}
+        return {
+            "status": "error",
+            "message": "No GitHub credentials available (connect GitHub or set GITHUB_TOKEN).",
+        }
 
     try:
         head = _current_branch(workspace)

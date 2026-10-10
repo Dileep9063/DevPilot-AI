@@ -27,7 +27,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.graph import END
 from rest_framework.test import APIClient
 
-from .models import AgentRun
+from .models import AgentRun, GitHubInstallation
 
 from core.agent import (
     extract_proposal_node,
@@ -621,7 +621,7 @@ class FullGraphDeliveryTests(TestCase):
         sh("git", "remote", "set-url", "origin", "https://github.com/test/repo.git", cwd=self.work)
         sh("git", "config", "remote.origin.pushurl", self.remote, cwd=self.work)
 
-    def _start(self, path="calc.py", content=None, proposal_type="existing_file"):
+    def _start(self, path="calc.py", content=None, proposal_type="existing_file", installation_id=0):
         from core import agent_service
         from core.agent import agent
 
@@ -631,7 +631,8 @@ class FullGraphDeliveryTests(TestCase):
         thread_id = str(uuid.uuid4())
         cfg = {"configurable": {"thread_id": thread_id}}
         agent.update_state(
-            cfg, agent_service._initial_state("Document add()", self.work, thread_id),
+            cfg,
+            agent_service._initial_state("Document add()", self.work, thread_id, installation_id),
             as_node="__start__",
         )
         agent.update_state(cfg, {
@@ -740,6 +741,80 @@ class FullGraphDeliveryTests(TestCase):
         self.assertEqual(push_request["tests"], "no_tests")
         self.assertIn("NOT verified", push_request["message"])
         self.assertIn("'status': 'no_tests'", second["test_result"])
+
+
+    def _fake_github_api(self):
+        from unittest import mock
+
+        class Resp:
+            def __init__(self, code, data):
+                self.status_code, self._d, self.text = code, data, ""
+
+            def json(self):
+                return self._d
+
+            def raise_for_status(self):
+                pass
+
+        fake = mock.MagicMock()
+        fake.RequestException = Exception
+        fake.get.return_value = Resp(200, {"default_branch": "main"})
+        fake.post.return_value = Resp(201, {"html_url": "https://github.com/test/repo/pull/9", "number": 9})
+        return fake
+
+    def test_github_app_mode_mints_fresh_tokens_and_never_stores_them(self):
+        import json
+        import os
+        from unittest import mock
+        from langgraph.types import Command
+        from core import github_app, tools
+
+        agent, cfg, thread_id = self._start(installation_id=4242)
+        agent.invoke(None, cfg)
+        agent.invoke(Command(resume="approve"), cfg)
+
+        fake = self._fake_github_api()
+        env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(tools, "requests", fake), \
+                mock.patch.object(github_app, "installation_token", return_value="ghs_secret") as mint:
+            final = agent.invoke(Command(resume="approve"), cfg)
+
+        # Minted separately for the push and for the PR, scoped to this repo.
+        self.assertEqual(mint.call_count, 2)
+        mint.assert_called_with(4242, "work")
+
+        # The token reached the GitHub API even though GITHUB_TOKEN is unset.
+        self.assertEqual(fake.get.call_args.kwargs["headers"]["Authorization"], "Bearer ghs_secret")
+        self.assertEqual(final["pr_url"], "https://github.com/test/repo/pull/9")
+
+        # ...and was never persisted: not in the checkpoint, not in .git/config.
+        saved = json.dumps(agent.get_state(cfg).values, default=str)
+        self.assertNotIn("ghs_secret", saved)
+        self.assertIn("4242", saved)
+        with open(f"{self.work}/.git/config") as f:
+            self.assertNotIn("ghs_secret", f.read())
+
+    def test_losing_the_installation_is_reported_as_push_failed(self):
+        from unittest import mock
+        from langgraph.types import Command
+        from core import agent_service, github_app
+
+        agent, cfg, thread_id = self._start(installation_id=4242)
+        agent.invoke(None, cfg)
+        agent.invoke(Command(resume="approve"), cfg)
+
+        with mock.patch.object(
+            github_app, "installation_token",
+            side_effect=github_app.GitHubAccessError("App is no longer installed"),
+        ):
+            final = agent.invoke(Command(resume="approve"), cfg)
+
+        payload = agent_service.serialize_result(final)
+        self.assertEqual(payload["status"], "push_failed")
+        self.assertIn("no longer installed", payload["error"])
+        self.assertEqual(self._remote_branches(), ["main"])
 
 
 class CleanupWorkspacesCommandTests(TestCase):
@@ -905,3 +980,358 @@ class TestOutcomeStatusTests(TestCase):
 
         self.assertEqual(payload["status"], "completed")
         self.assertEqual(payload["error"], "")
+
+
+# ============================================================
+# GitHub App (per-user repository access)
+# ============================================================
+
+def _rsa_pem():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    public = key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    return private, public
+
+
+APP_ENV_KEYS = (
+    "GITHUB_APP_ID", "GITHUB_APP_SLUG", "GITHUB_APP_CLIENT_ID",
+    "GITHUB_APP_CLIENT_SECRET", "GITHUB_APP_PRIVATE_KEY", "GITHUB_APP_PRIVATE_KEY_PATH",
+)
+
+
+class GitHubAppTestBase(TestCase):
+    """Sets (or clears) the GitHub App environment for a test."""
+
+    def configure_app(self, enabled=True):
+        import os
+        from unittest import mock
+
+        env = {k: v for k, v in os.environ.items() if k not in APP_ENV_KEYS}
+        self.private_pem, self.public_pem = _rsa_pem()
+
+        if enabled:
+            env.update({
+                "GITHUB_APP_ID": "123456",
+                "GITHUB_APP_SLUG": "devpilot-test-app",
+                "GITHUB_APP_CLIENT_ID": "Iv1.client",
+                "GITHUB_APP_CLIENT_SECRET": "client-secret",
+                "GITHUB_APP_PRIVATE_KEY": self.private_pem.replace("\n", "\\n"),
+            })
+
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class GitHubAppUnitTests(GitHubAppTestBase):
+
+    def test_not_configured_without_environment(self):
+        from core import github_app
+
+        self.configure_app(enabled=False)
+        self.assertFalse(github_app.is_configured())
+
+    def test_configured_with_escaped_newline_key(self):
+        from core import github_app
+
+        self.configure_app()
+        self.assertTrue(github_app.is_configured())
+
+    def test_private_key_can_come_from_a_file(self):
+        import os
+        import tempfile
+        from core import github_app
+
+        self.configure_app()
+        os.environ.pop("GITHUB_APP_PRIVATE_KEY")
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+            f.write(self.private_pem)
+        self.addCleanup(os.unlink, f.name)
+        os.environ["GITHUB_APP_PRIVATE_KEY_PATH"] = f.name
+
+        self.assertTrue(github_app.is_configured())
+
+    def test_app_jwt_is_rs256_and_short_lived(self):
+        import jwt
+        from core import github_app
+
+        self.configure_app()
+        token = github_app.app_jwt()
+        claims = jwt.decode(token, self.public_pem, algorithms=["RS256"], options={"verify_iat": False})
+
+        self.assertEqual(claims["iss"], "123456")
+        self.assertLessEqual(claims["exp"] - claims["iat"], 10 * 60 + 60)
+
+    def test_state_round_trip_and_tampering(self):
+        from core import github_app
+
+        state = github_app.make_state(7)
+        self.assertEqual(github_app.read_state(state), 7)
+        self.assertIsNone(github_app.read_state(state + "x"))
+        self.assertIsNone(github_app.read_state(""))
+
+    def test_expired_state_is_rejected(self):
+        from unittest import mock
+        from core import github_app
+
+        state = github_app.make_state(7)
+        with mock.patch.object(github_app, "STATE_MAX_AGE", -1):
+            self.assertIsNone(github_app.read_state(state))
+
+    def test_connect_url_carries_state(self):
+        from core import github_app
+
+        self.configure_app()
+        url = github_app.connect_url("abc:def")
+        self.assertTrue(url.startswith("https://github.com/apps/devpilot-test-app/installations/new?state="))
+
+    def _resp(self, code, data=None):
+        from unittest import mock
+
+        r = mock.MagicMock()
+        r.status_code = code
+        r.json.return_value = data or {}
+        r.raise_for_status.side_effect = None if code < 400 else Exception(f"HTTP {code}")
+        return r
+
+    def test_installation_token_is_scoped_to_one_repository(self):
+        from unittest import mock
+        from core import github_app
+
+        self.configure_app()
+        with mock.patch.object(github_app.requests, "post", return_value=self._resp(201, {"token": "ghs_x"})) as post:
+            token = github_app.installation_token(55, "my-repo")
+
+        self.assertEqual(token, "ghs_x")
+        self.assertEqual(post.call_args.kwargs["json"], {"repositories": ["my-repo"]})
+        self.assertTrue(post.call_args.kwargs["headers"]["Authorization"].startswith("Bearer "))
+        self.assertIn("/app/installations/55/access_tokens", post.call_args.args[0])
+
+    def test_installation_token_errors_are_actionable(self):
+        from unittest import mock
+        from core import github_app
+
+        self.configure_app()
+        for code, fragment in ((404, "no longer installed"), (422, "does not have access")):
+            with mock.patch.object(github_app.requests, "post", return_value=self._resp(code)):
+                with self.assertRaises(github_app.GitHubAccessError) as ctx:
+                    github_app.installation_token(55, "my-repo")
+            self.assertIn(fragment, str(ctx.exception))
+
+    def test_find_repo_installation(self):
+        from unittest import mock
+        from core import github_app
+
+        self.configure_app()
+        with mock.patch.object(github_app.requests, "get", return_value=self._resp(200, {"id": 99})):
+            self.assertEqual(github_app.find_repo_installation("o", "r"), 99)
+        with mock.patch.object(github_app.requests, "get", return_value=self._resp(404)):
+            self.assertIsNone(github_app.find_repo_installation("o", "r"))
+
+    def test_clone_credential_is_not_written_to_git_config(self):
+        from unittest import mock
+        from core import agent_service
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.MagicMock()
+
+        thread_id = agent_service.new_thread_id()
+        with mock.patch.object(agent_service.subprocess, "run", side_effect=fake_run):
+            agent_service._prepare_repository("https://github.com/o/r", thread_id, "ghs_secret")
+
+        cmd = calls[0]
+        # top-level `git -c ... clone` is per-process; `clone -c` would persist it
+        self.assertLess(cmd.index("-c"), cmd.index("clone"))
+        self.assertTrue(cmd[cmd.index("-c") + 1].startswith("http.extraheader="))
+        self.assertNotIn("ghs_secret", " ".join(cmd))  # base64-encoded, not plain
+
+        import shutil
+        shutil.rmtree(agent_service._workspace_for_thread(thread_id), ignore_errors=True)
+
+    def test_clone_failure_message_hides_the_token(self):
+        import subprocess
+        from unittest import mock
+        from core import agent_service
+
+        err = subprocess.CalledProcessError(128, "git", stderr="fatal: bad ghs_secret creds")
+        thread_id = agent_service.new_thread_id()
+        with mock.patch.object(agent_service.subprocess, "run", side_effect=err):
+            with self.assertRaises(ValueError) as ctx:
+                agent_service._prepare_repository("https://github.com/o/r", thread_id, "ghs_secret")
+
+        self.assertNotIn("ghs_secret", str(ctx.exception))
+
+        import shutil
+        shutil.rmtree(agent_service._workspace_for_thread(thread_id), ignore_errors=True)
+
+
+class GitHubAccessResolutionTests(GitHubAppTestBase):
+
+    def setUp(self):
+        self.configure_app()
+        self.alice = User.objects.create_user(username="alice_gh", password="Testuser@123")
+        self.bob = User.objects.create_user(username="bob_gh", password="Testuser@123")
+
+    def test_user_who_has_not_connected_is_told_to_connect(self):
+        from core import github_app
+
+        with self.assertRaises(github_app.GitHubAccessError) as ctx:
+            github_app.resolve_repo_access(self.alice, "alice", "repo")
+        self.assertIn("Connect your GitHub account", str(ctx.exception))
+
+    def test_repo_without_the_app_installed(self):
+        from unittest import mock
+        from core import github_app
+
+        GitHubInstallation.objects.create(user=self.alice, installation_id=1)
+        with mock.patch.object(github_app, "find_repo_installation", return_value=None):
+            with self.assertRaises(github_app.GitHubAccessError) as ctx:
+                github_app.resolve_repo_access(self.alice, "alice", "repo")
+        self.assertIn("not installed on alice/repo", str(ctx.exception))
+
+    def test_cannot_use_someone_elses_installation(self):
+        """Bob must not push to Alice's repo just because the App is installed there."""
+        from unittest import mock
+        from core import github_app
+
+        GitHubInstallation.objects.create(user=self.alice, installation_id=1)
+        GitHubInstallation.objects.create(user=self.bob, installation_id=2)
+
+        with mock.patch.object(github_app, "find_repo_installation", return_value=1):
+            self.assertEqual(github_app.resolve_repo_access(self.alice, "alice", "repo"), 1)
+            with self.assertRaises(github_app.GitHubAccessError) as ctx:
+                github_app.resolve_repo_access(self.bob, "alice", "repo")
+        self.assertIn("not connected to your DevPilot account", str(ctx.exception))
+
+
+class GitHubConnectApiTests(GitHubAppTestBase):
+
+    def setUp(self):
+        self.configure_app()
+        self.client = APIClient()
+        self.user = User.objects.create_user(username="gh_user", password="Testuser@123")
+
+    def _callback(self, **params):
+        from django.test import Client
+
+        return Client().get("/api/github/callback/", params)
+
+    def test_endpoints_require_authentication(self):
+        for path in ("/api/github/status/", "/api/github/connect/"):
+            self.assertEqual(self.client.get(path).status_code, 401)
+        self.assertEqual(self.client.post("/api/github/disconnect/").status_code, 401)
+
+    def test_status_reports_configuration_and_connections(self):
+        self.client.force_authenticate(user=self.user)
+        data = self.client.get("/api/github/status/").json()
+        self.assertTrue(data["app_configured"])
+        self.assertFalse(data["connected"])
+
+        GitHubInstallation.objects.create(user=self.user, installation_id=5, account_login="octo")
+        data = self.client.get("/api/github/status/").json()
+        self.assertTrue(data["connected"])
+        self.assertEqual(data["installations"][0]["account"], "octo")
+
+    def test_connect_returns_install_url_with_signed_state(self):
+        from urllib.parse import parse_qs, urlparse
+        from core import github_app
+
+        self.client.force_authenticate(user=self.user)
+        url = self.client.get("/api/github/connect/").json()["url"]
+        state = parse_qs(urlparse(url).query)["state"][0]
+        self.assertEqual(github_app.read_state(state), self.user.id)
+
+    def test_connect_fails_cleanly_when_app_not_configured(self):
+        self.configure_app(enabled=False)
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(self.client.get("/api/github/connect/").status_code, 400)
+
+    def test_callback_saves_a_verified_installation(self):
+        from unittest import mock
+        from core import github_app
+
+        state = github_app.make_state(self.user.id)
+        with mock.patch.object(github_app, "exchange_code", return_value="user-token"), \
+                mock.patch.object(github_app, "user_installations", return_value=[
+                    {"id": 77, "account": {"login": "octo"}, "repository_selection": "selected"}]):
+            res = self._callback(code="c", installation_id="77", setup_action="install", state=state)
+
+        self.assertEqual(res.status_code, 302)
+        self.assertIn("github=connected", res["Location"])
+        saved = GitHubInstallation.objects.get(user=self.user)
+        self.assertEqual((saved.installation_id, saved.account_login), (77, "octo"))
+
+    def test_callback_rejects_an_installation_the_user_does_not_own(self):
+        """Forged installation_id: GitHub's own list for this user does not contain it."""
+        from unittest import mock
+        from core import github_app
+
+        state = github_app.make_state(self.user.id)
+        with mock.patch.object(github_app, "exchange_code", return_value="user-token"), \
+                mock.patch.object(github_app, "user_installations", return_value=[{"id": 1, "account": {"login": "me"}}]):
+            res = self._callback(code="c", installation_id="999", state=state)
+
+        self.assertIn("github=error", res["Location"])
+        self.assertEqual(GitHubInstallation.objects.count(), 0)
+
+    def test_callback_rejects_bad_state_and_missing_code(self):
+        from core import github_app
+
+        res = self._callback(code="c", installation_id="1", state="forged")
+        self.assertIn("github=error", res["Location"])
+
+        res = self._callback(installation_id="1", state=github_app.make_state(self.user.id))
+        self.assertIn("github=error", res["Location"])
+        self.assertEqual(GitHubInstallation.objects.count(), 0)
+
+    def test_disconnect_removes_connections(self):
+        GitHubInstallation.objects.create(user=self.user, installation_id=5)
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(self.client.post("/api/github/disconnect/").json()["disconnected"], 1)
+        self.assertEqual(GitHubInstallation.objects.count(), 0)
+
+    def test_run_requires_a_connected_account_in_app_mode(self):
+        self.client.force_authenticate(user=self.user)
+        res = self.client.post("/api/agent/run/", {"task": "t", "repo_url": "https://github.com/o/r"}, format="json")
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(res.json()["code"], "github_access")
+
+    def test_run_passes_the_resolved_installation_to_the_agent(self):
+        from unittest import mock
+        from core import agent_service, github_app
+
+        GitHubInstallation.objects.create(user=self.user, installation_id=99)
+        self.client.force_authenticate(user=self.user)
+
+        with mock.patch.object(github_app, "find_repo_installation", return_value=99), \
+                mock.patch.object(agent_service, "run_agent_task", return_value={"final_result": "ok"}) as run:
+            res = self.client.post("/api/agent/run/", {"task": "t", "repo_url": "https://github.com/o/r"}, format="json")
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(run.call_args.args[3], 99)
+
+    def test_single_token_mode_still_works_without_an_app(self):
+        from unittest import mock
+        from core import agent_service
+
+        self.configure_app(enabled=False)
+        self.client.force_authenticate(user=self.user)
+
+        with mock.patch.object(agent_service, "run_agent_task", return_value={"final_result": "ok"}) as run:
+            res = self.client.post("/api/agent/run/", {"task": "t", "repo_url": "https://github.com/o/r"}, format="json")
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(run.call_args.args[3], 0)

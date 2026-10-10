@@ -11,6 +11,9 @@ SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-only-change-me")
 DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() == "true"
 ALLOWED_HOSTS = [x.strip() for x in os.getenv("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if x.strip()]
 
+# Where the browser is sent after connecting GitHub (the React app).
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
 # Where per-run repository clones live.
 DEVPILOT_WORKSPACE_ROOT = os.getenv("DEVPILOT_WORKSPACE_ROOT", str(BASE_DIR / "workspace"))
 

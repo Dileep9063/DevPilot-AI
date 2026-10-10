@@ -5,6 +5,7 @@ import AuthForm from "./components/AuthForm";
 import ApprovalCard from "./components/ApprovalCard";
 import ResultCard from "./components/ResultCard";
 import HistoryList from "./components/HistoryList";
+import GitHubConnect from "./components/GitHubConnect";
 
 export default function App() {
   const [authed, setAuthed] = useState(() => !!tokens.access());
@@ -121,6 +122,8 @@ export default function App() {
         <h1>DevPilot AI</h1>
         <button className="link" onClick={logout}>Log out</button>
       </header>
+
+      <GitHubConnect />
 
       <form className="card" onSubmit={run}>
         <h2>New task</h2>

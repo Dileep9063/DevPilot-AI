@@ -73,6 +73,9 @@ export const api = {
   runAgent: (repo_url, task) => post("/api/agent/run/", { repo_url, task }),
   resume: (thread_id, decision) =>
     post("/api/agent/resume/", { thread_id, decision }),
+  githubStatus: () => get("/api/github/status/"),
+  githubConnect: () => get("/api/github/connect/"),
+  githubDisconnect: () => post("/api/github/disconnect/", {}),
   runs: () => get("/api/agent/runs/"),
   runDetail: (thread_id) => get(`/api/agent/runs/${thread_id}/`),
 };

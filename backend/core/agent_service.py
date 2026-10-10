@@ -13,6 +13,9 @@ from core.agent import agent
 
 from django.conf import settings
 
+from core import github_app
+from core.tools import github_auth_args
+
 WORKSPACE_ROOT = Path(settings.DEVPILOT_WORKSPACE_ROOT).resolve()
 
 
@@ -50,7 +53,7 @@ def _validate_github_url(repo_url: str) -> tuple[str, str]:
     return owner, repo_name
 
 
-def _prepare_repository(repo_url: str, thread_id: str) -> str:
+def _prepare_repository(repo_url: str, thread_id: str, token: str | None = None) -> str:
     owner, repo_name = _validate_github_url(repo_url)
 
     run_workspace = _workspace_for_thread(thread_id)
@@ -66,10 +69,16 @@ def _prepare_repository(repo_url: str, thread_id: str) -> str:
 
         return str(repo_workspace)
 
+    # With a GitHub App token the clone also works for private repositories.
+    # The credential is passed to this one git process only (see
+    # github_auth_args), so it is never written to .git/config.
+    auth = github_auth_args(token) if token else []
+
     try:
         subprocess.run(
             [
                 "git",
+                *auth,
                 "clone",
                 "--depth",
                 "1",
@@ -84,10 +93,10 @@ def _prepare_repository(repo_url: str, thread_id: str) -> str:
         )
 
     except subprocess.CalledProcessError as exc:
-        raise ValueError(
-            "Unable to clone GitHub repository: "
-            f"{exc.stderr.strip() or exc.stdout.strip()}"
-        ) from exc
+        detail = exc.stderr.strip() or exc.stdout.strip()
+        if token:
+            detail = detail.replace(token, "***")
+        raise ValueError(f"Unable to clone GitHub repository: {detail}") from exc
 
     except subprocess.TimeoutExpired as exc:
         raise ValueError(
@@ -176,7 +185,8 @@ def validate_owned_thread(user, thread_id: str) -> str:
 def _initial_state(
     task: str,
     workspace_path: str,
-    thread_id: str
+    thread_id: str,
+    installation_id: int = 0,
 ) -> dict:
 
     return {
@@ -197,6 +207,9 @@ def _initial_state(
         "push_result": "",
         "pr_url": "",
         "pr_result": "",
+        # Only the (non-secret) installation id is stored in the checkpoint.
+        # Tokens are minted when needed because they expire after ~1 hour.
+        "github_installation_id": installation_id,
         "workspace_path": workspace_path,
         "agent_steps": 0,
         "debug_attempts": 0,
@@ -206,10 +219,18 @@ def run_agent_task(
     task: str,
     thread_id: str,
     repo_url: str,
+    installation_id: int = 0,
 ) -> dict:
+    clone_token = None
+
+    if installation_id:
+        _, repo_name = _validate_github_url(repo_url)
+        clone_token = github_app.installation_token(installation_id, repo_name)
+
     workspace_path = _prepare_repository(
         repo_url,
         thread_id,
+        clone_token,
     )
 
     return agent.invoke(
@@ -217,6 +238,7 @@ def run_agent_task(
             task,
             workspace_path,
             thread_id,
+            installation_id,
         ),
         {
             "configurable": {

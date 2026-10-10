@@ -185,6 +185,18 @@ All endpoints except register/login need `Authorization: Bearer <access>`.
 | POST | `/api/agent/resume/` | `{thread_id, decision: "approve"\|"reject"}` |
 | GET | `/api/agent/runs/` | your recent runs |
 | GET | `/api/agent/runs/<thread_id>/` | one run (+ pending approval if paused) |
+| GET | `/api/github/status/`, `/api/github/connect/` | GitHub App connection state / install URL |
+| POST | `/api/github/disconnect/` | forget the user's GitHub connections |
+| GET | `/api/github/callback/` | where GitHub returns after installation (browser redirect) |
+
+## GitHub access: personal token or GitHub App
+
+- **Single token (default):** `GITHUB_TOKEN` in `.env`; you grant that token
+  access to each repository.
+- **GitHub App:** every user clicks **Connect GitHub** once and chooses which
+  repositories to share; DevPilot mints short-lived, per-repository tokens and
+  also works with private repositories. Setup (one-time registration):
+  **[docs/GITHUB_APP_SETUP.md](docs/GITHUB_APP_SETUP.md)**.
 
 ## Testing
 
