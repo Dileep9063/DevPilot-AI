@@ -36,6 +36,7 @@ jobs:
       DJANGO_DB_PASSWORD: postgres
       LANGGRAPH_POSTGRES_URI: postgresql://postgres:postgres@127.0.0.1:5432/devpilot
       LLM_PROVIDER_ORDER: ""
+      GEMINI_API_KEY: ci-dummy-key-not-used
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
