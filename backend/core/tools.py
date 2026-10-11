@@ -1570,7 +1570,7 @@ def _build_test_command(command, workspace, mode=None):
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
         "--",
         *command,
-    ])
+    ]
     return args
 
 
