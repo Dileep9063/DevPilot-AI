@@ -1,8 +1,10 @@
 import os
 import subprocess
 import sys
+import shutil
 import tempfile
 from unittest import mock
+import unittest
 
 from django.test import SimpleTestCase
 
@@ -105,3 +107,40 @@ class BoundedTestOutputTests(SimpleTestCase):
                     timeout=0.1,
                     max_output_bytes=128,
                 )
+
+
+    def test_workspace_growth_limit_terminates_process(self):
+        script = (
+            "import pathlib,time; "
+            "pathlib.Path('large.bin').write_bytes(b'x' * 4096); "
+            "time.sleep(5)"
+        )
+        with tempfile.TemporaryDirectory() as workspace:
+            with self.assertRaisesRegex(RuntimeError, "workspace output exceeded"):
+                _run_bounded_subprocess(
+                    [sys.executable, "-c", script],
+                    cwd=workspace,
+                    env={"PATH": os.environ.get("PATH", "")},
+                    timeout=10,
+                    max_output_bytes=128,
+                    max_workspace_bytes=1024,
+                    max_workspace_files=10,
+                )
+
+    @unittest.skipUnless(shutil.which("bwrap") and shutil.which("prlimit"), "Bubblewrap not installed")
+    def test_bubblewrap_executes_inside_isolation(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            command = _build_test_command(
+                [sys.executable, "-c", "print('sandbox-ok')"],
+                workspace,
+                mode="bubblewrap",
+            )
+            result = _run_bounded_subprocess(
+                command,
+                cwd=workspace,
+                env=_sanitized_env(workspace),
+                timeout=15,
+                max_output_bytes=1024,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sandbox-ok", result.stdout)
