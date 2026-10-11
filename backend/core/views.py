@@ -1,5 +1,6 @@
 import logging
 
+from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -78,7 +79,7 @@ def agent_run(request):
         if settings.DEVPILOT_ASYNC_RUNS:
             from .tasks import run_agent_job
 
-            AgentRun.objects.filter(thread_id=thread_id).update(status="queued")
+            AgentRun.objects.filter(thread_id=thread_id).update(status="queued", updated_at=timezone.now())
             try:
                 run_agent_job.delay(thread_id, task, repo_url, installation_id)
             except Exception:
@@ -123,27 +124,32 @@ def agent_resume(request):
     try:
         agent_service.validate_owned_thread(request.user, thread_id)
         from django.conf import settings
+        run_record = AgentRun.objects.get(thread_id=thread_id)
+        installation_id = 0
+        if github_app.is_configured():
+            owner, repo_name = agent_service._validate_github_url(run_record.repo_url)
+            installation_id = github_app.resolve_repo_access(request.user, owner, repo_name)
 
         if settings.DEVPILOT_ASYNC_RUNS:
             from .tasks import resume_agent_job
 
             claimed = AgentRun.objects.filter(
                 thread_id=thread_id, status="waiting_for_approval"
-            ).update(status="queued")
+            ).update(status="queued", updated_at=timezone.now())
             if not claimed:
                 return Response(
                     {"error": "This run is not waiting for approval or has already been resumed."},
                     status=409,
                 )
             try:
-                resume_agent_job.delay(thread_id, decision)
+                resume_agent_job.delay(thread_id, decision, installation_id)
             except Exception:
                 logger.exception("Could not enqueue agent resume (thread_id=%s)", thread_id)
                 agent_service.record_run_outcome(thread_id, error="The resume job could not be queued.")
                 return Response({"error": "The resume job could not be queued. Please retry."}, status=503)
             return Response({"status": "queued", "thread_id": thread_id}, status=202)
 
-        result = agent_service.resume_agent_task(thread_id, decision)
+        result = agent_service.resume_agent_task(thread_id, decision, installation_id)
     except agent_service.ThreadOwnershipError as e:
         return Response({"error": str(e)}, status=403)
     except ValueError as e:
