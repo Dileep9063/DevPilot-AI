@@ -174,9 +174,29 @@ def invoke_with_fallback(
             started = time.monotonic()
             try:
                 result = runnable.invoke(messages)
+                latency_ms = round((time.monotonic() - started) * 1000)
+                usage = getattr(result, "usage_metadata", None) or {}
+                response_meta = getattr(result, "response_metadata", None) or {}
+                token_usage = response_meta.get("token_usage") or response_meta.get("usage") or {}
+                input_tokens = usage.get("input_tokens", token_usage.get("prompt_tokens"))
+                output_tokens = usage.get("output_tokens", token_usage.get("completion_tokens"))
+                estimated_cost = None
+                if isinstance(input_tokens, (int, float)) and isinstance(output_tokens, (int, float)):
+                    try:
+                        input_rate = max(0.0, float(os.environ.get(f"LLM_COST_{name.upper()}_INPUT_PER_1M", "0")))
+                        output_rate = max(0.0, float(os.environ.get(f"LLM_COST_{name.upper()}_OUTPUT_PER_1M", "0")))
+                        estimated_cost = (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+                    except (TypeError, ValueError):
+                        estimated_cost = None
                 logger.info(
-                    "LLM provider succeeded: provider=%s attempt=%s latency_ms=%s",
-                    name, attempt + 1, round((time.monotonic() - started) * 1000),
+                    "LLM usage: provider=%s model=%s attempt=%s latency_ms=%s input_tokens=%s output_tokens=%s estimated_cost_usd=%s",
+                    name,
+                    response_meta.get("model_name") or response_meta.get("model") or "unknown",
+                    attempt + 1,
+                    latency_ms,
+                    input_tokens if isinstance(input_tokens, (int, float)) else "unknown",
+                    output_tokens if isinstance(output_tokens, (int, float)) else "unknown",
+                    round(estimated_cost, 8) if estimated_cost is not None else "unknown",
                 )
                 return result
 
