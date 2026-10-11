@@ -269,6 +269,32 @@ class AgentApiValidationTests(TestCase):
             response.status_code,
             400,
         )
+    def test_agent_run_rejects_non_string_task(self):
+        response = self.client.post(
+            "/api/agent/run/",
+            {"task": ["unexpected"], "repo_url": "https://github.com/owner/repo"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_agent_run_rejects_oversized_task(self):
+        response = self.client.post(
+            "/api/agent/run/",
+            {"task": "x" * 4001, "repo_url": "https://github.com/owner/repo"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_agent_run_rejects_non_github_url_before_creating_run(self):
+        before = AgentRun.objects.count()
+        response = self.client.post(
+            "/api/agent/run/",
+            {"task": "test", "repo_url": "https://example.com/owner/repo"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(AgentRun.objects.count(), before)
+
     def test_agent_run_requires_authentication(self):
         self.client.force_authenticate(user=None)
 
