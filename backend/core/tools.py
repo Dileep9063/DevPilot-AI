@@ -1584,10 +1584,29 @@ def _build_test_command(command, workspace, mode=None):
 _MAX_CAPTURE_BYTES = 80000
 
 
-def _run_bounded_subprocess(command, cwd, env, timeout=120, max_output_bytes=_MAX_CAPTURE_BYTES):
-    """Run a command while draining stdout/stderr without unbounded buffering."""
+def _run_bounded_subprocess(
+    command,
+    cwd,
+    env,
+    timeout=120,
+    max_output_bytes=_MAX_CAPTURE_BYTES,
+    max_workspace_bytes=None,
+    max_workspace_files=None,
+):
+    """Run a command with bounded output and best-effort workspace growth limits.
+
+    Workspace limits are monitored periodically and are not a kernel-enforced
+    disk quota. Per-file limits in bubblewrap mode provide an additional guard.
+    """
     import signal
     import threading
+
+    max_workspace_bytes = max_workspace_bytes or int(
+        os.environ.get("DEVPILOT_TEST_MAX_WORKSPACE_BYTES", 500 * 1024 * 1024)
+    )
+    max_workspace_files = max_workspace_files or int(
+        os.environ.get("DEVPILOT_TEST_MAX_WORKSPACE_FILES", 50000)
+    )
 
     process = subprocess.Popen(
         command,
@@ -1622,6 +1641,47 @@ def _run_bounded_subprocess(command, cwd, env, timeout=120, max_output_bytes=_MA
         reader.start()
 
     timed_out = False
+    workspace_limit_exceeded = threading.Event()
+    workspace_root = Path(cwd).resolve()
+
+    def monitor_workspace():
+        while process.poll() is None:
+            total_bytes = 0
+            total_files = 0
+            try:
+                for root, dirs, files in os.walk(workspace_root, followlinks=False):
+                    dirs[:] = [
+                        name for name in dirs
+                        if not (Path(root) / name).is_symlink()
+                    ]
+                    for name in files:
+                        path = Path(root) / name
+                        try:
+                            if path.is_symlink():
+                                continue
+                            stat_result = path.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if not path.is_file():
+                            continue
+                        total_files += 1
+                        total_bytes += stat_result.st_size
+                        if total_bytes > max_workspace_bytes or total_files > max_workspace_files:
+                            workspace_limit_exceeded.set()
+                            try:
+                                if os.name != "nt":
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                else:
+                                    process.kill()
+                            except ProcessLookupError:
+                                pass
+                            return
+            except OSError:
+                pass
+            time.sleep(0.5)
+
+    monitor = threading.Thread(target=monitor_workspace, daemon=True)
+    monitor.start()
     try:
         return_code = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -1634,6 +1694,7 @@ def _run_bounded_subprocess(command, cwd, env, timeout=120, max_output_bytes=_MA
         except ProcessLookupError:
             pass
         return_code = process.wait()
+    monitor.join(timeout=1)
 
     for reader in readers:
         reader.join(timeout=2)
@@ -1648,6 +1709,11 @@ def _run_bounded_subprocess(command, cwd, env, timeout=120, max_output_bytes=_MA
         return value
 
     stdout, stderr = output("stdout"), output("stderr")
+    if workspace_limit_exceeded.is_set():
+        raise RuntimeError(
+            "Repository test stopped because workspace output exceeded the configured "
+            "file-count or disk-usage limit."
+        )
     if timed_out:
         raise subprocess.TimeoutExpired(
             command, timeout, output=stdout, stderr=stderr
