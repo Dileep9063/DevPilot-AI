@@ -66,6 +66,7 @@ def recover_stale_agent_runs():
         )
         count = stale_runs.update(
             status="error",
+            updated_at=timezone.now(),
             summary=(
                 "This run was interrupted because its worker did not finish "
                 "within the recovery window. Please start a new run."
