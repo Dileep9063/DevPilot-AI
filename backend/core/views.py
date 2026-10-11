@@ -127,7 +127,14 @@ def agent_resume(request):
         if settings.DEVPILOT_ASYNC_RUNS:
             from .tasks import resume_agent_job
 
-            AgentRun.objects.filter(thread_id=thread_id).update(status="queued")
+            claimed = AgentRun.objects.filter(
+                thread_id=thread_id, status="waiting_for_approval"
+            ).update(status="queued")
+            if not claimed:
+                return Response(
+                    {"error": "This run is not waiting for approval or has already been resumed."},
+                    status=409,
+                )
             try:
                 resume_agent_job.delay(thread_id, decision)
             except Exception:
