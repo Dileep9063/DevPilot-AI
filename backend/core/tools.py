@@ -1550,7 +1550,7 @@ def _build_test_command(command, workspace, mode=None):
         "--new-session",
     ]
     # Mount the runtime read-only; the app process runs as an unprivileged user.
-    for system_path in ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/app", "/opt", "/var"):
+    for system_path in ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/app", "/opt"):
         if Path(system_path).exists():
             args.extend(["--ro-bind", system_path, system_path])
 
