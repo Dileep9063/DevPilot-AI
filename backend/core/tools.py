@@ -207,7 +207,13 @@ def _stage_changes(workspace):
 
     # Clear any pre-existing index entries first. Repository tests/build hooks
     # may run `git add`; never let those staged files sneak into an agent commit.
-    _git(["reset", "--quiet"], workspace)
+    # `git reset` needs HEAD, so use rm --cached for an unborn repository.
+    try:
+        _git(["rev-parse", "--verify", "HEAD"], workspace)
+    except subprocess.CalledProcessError:
+        _git(["rm", "--cached", "-r", "-f", "--ignore-unmatch", "."], workspace)
+    else:
+        _git(["reset", "--quiet"], workspace)
     if written:
         _git(["add", "--", *written], workspace)
     # Fail closed: never stage arbitrary repository changes when the agent
