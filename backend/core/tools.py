@@ -68,7 +68,17 @@ def reset_github_token(ctx_token):
 
 
 def get_github_token():
-    return _github_token_context.get() or os.environ.get("GITHUB_TOKEN") or ""
+    # Per-user GitHub App tokens always win. Production Compose disables the
+    # shared fallback so one deployment token cannot write across user accounts.
+    scoped_token = _github_token_context.get()
+    if scoped_token:
+        return scoped_token
+    try:
+        from django.conf import settings
+        allow_shared = getattr(settings, "DEVPILOT_ALLOW_SHARED_GITHUB_TOKEN", True)
+    except Exception:
+        allow_shared = True  # standalone trusted local tools/tests
+    return (os.environ.get("GITHUB_TOKEN") or "") if allow_shared else ""
 
 
 def github_auth_args(token: str):
