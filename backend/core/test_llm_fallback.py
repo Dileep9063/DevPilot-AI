@@ -82,3 +82,40 @@ def test_transient_detection():
     assert lp.is_transient_provider_error(Exception("429 rate limit"))
     assert lp.is_transient_provider_error(Exception("quota exceeded"))
     assert not lp.is_transient_provider_error(Exception("invalid request"))
+
+
+
+def test_usage_logging_includes_tokens_and_configured_cost(monkeypatch, caplog):
+    class UsageResult:
+        usage_metadata = {"input_tokens": 1000, "output_tokens": 500}
+        response_metadata = {"model_name": "test-model"}
+
+    class UsageFake(Fake):
+        def invoke(self, messages):
+            self.calls.append(self.name)
+            return UsageResult()
+
+    monkeypatch.setenv("LLM_COST_TEST_INPUT_PER_1M", "2")
+    monkeypatch.setenv("LLM_COST_TEST_OUTPUT_PER_1M", "4")
+    fake = UsageFake("test")
+
+    with caplog.at_level("INFO", logger="core.llm_providers"):
+        lp.invoke_with_fallback(
+            ["hello"], providers=[("test", fake)], retries=0, sleep=NOSLEEP
+        )
+
+    line = next(record.getMessage() for record in caplog.records if "LLM usage:" in record.getMessage())
+    assert "input_tokens=1000" in line
+    assert "output_tokens=500" in line
+    assert "estimated_cost_usd=0.004" in line
+    assert "test-model" in line
+
+
+def test_usage_logging_handles_missing_token_metadata(caplog):
+    with caplog.at_level("INFO", logger="core.llm_providers"):
+        lp.invoke_with_fallback(
+            ["hello"], providers=[("test", Fake("test"))], retries=0, sleep=NOSLEEP
+        )
+    line = next(record.getMessage() for record in caplog.records if "LLM usage:" in record.getMessage())
+    assert "input_tokens=unknown" in line
+    assert "output_tokens=unknown" in line
