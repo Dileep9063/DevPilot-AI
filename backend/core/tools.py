@@ -1491,6 +1491,20 @@ def write_new_file(
 # RUN TESTS
 # ============================================================
 
+_MAX_TEST_OUTPUT_CHARS = 20000
+
+
+def _bounded_output(value):
+    """Decode and cap command output before storing it in agent state."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    value = str(value)
+    if len(value) <= _MAX_TEST_OUTPUT_CHARS:
+        return value
+    omitted = len(value) - _MAX_TEST_OUTPUT_CHARS
+    return value[:_MAX_TEST_OUTPUT_CHARS] + f"\n...[truncated {omitted} characters]"
 @tool
 def run_tests():
     """
@@ -1623,21 +1637,17 @@ def run_tests():
             "command":
                 command,
 
-            "stdout":
-                result.stdout,
+            "stdout": _bounded_output(result.stdout),
 
-            "stderr":
-                result.stderr,
+            "stderr": _bounded_output(result.stderr),
         }
 
-    except subprocess.TimeoutExpired:
-
+    except subprocess.TimeoutExpired as exc:
         return {
-            "status":
-                "error",
-
-            "message":
-                "Test/build execution timed out after 120 seconds.",
+            "status": "error",
+            "message": "Test/build execution timed out after 120 seconds.",
+            "stdout": _bounded_output(exc.stdout),
+            "stderr": _bounded_output(exc.stderr),
         }
 
     except FileNotFoundError as e:
