@@ -43,6 +43,39 @@ def test_commit_and_push(repo):
     assert t.git_push.invoke({})["status"] == "success"
 
 
+def test_commit_does_not_stage_unrecorded_files(repo):
+    t.create_agent_branch.invoke({"branch_name": "devpilot/unrecorded"})
+    (repo / "unrelated.txt").write_text("do not commit\n")
+
+    result = t.git_commit.invoke({"message": "should not include unrelated file"})
+
+    assert result["status"] == "nothing_to_commit"
+    assert not subprocess.run(
+        ["git", "cat-file", "-e", "HEAD:unrelated.txt"],
+        cwd=repo,
+        capture_output=True,
+    ).returncode
+
+
+def test_commit_stages_only_recorded_files(repo):
+    t.create_agent_branch.invoke({"branch_name": "devpilot/only-recorded"})
+    (repo / "approved.py").write_text("approved = True\n")
+    (repo / "unrelated.txt").write_text("unrelated\n")
+    t._record_written("approved.py")
+
+    result = t.git_commit.invoke({"message": "commit approved file"})
+
+    assert result["status"] == "success"
+    changed = subprocess.run(
+        ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert changed == ["approved.py"]
+
+
 def test_pr_requires_token(repo, monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     assert t.create_pull_request.invoke({"title": "t"})["status"] == "error"
