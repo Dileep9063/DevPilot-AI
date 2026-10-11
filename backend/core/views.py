@@ -73,6 +73,20 @@ def agent_run(request):
                 request.user, owner, repo_name
             )
 
+        from django.conf import settings
+
+        if settings.DEVPILOT_ASYNC_RUNS:
+            from .tasks import run_agent_job
+
+            AgentRun.objects.filter(thread_id=thread_id).update(status="queued")
+            try:
+                run_agent_job.delay(thread_id, task, repo_url, installation_id)
+            except Exception:
+                logger.exception("Could not enqueue agent run (thread_id=%s)", thread_id)
+                agent_service.record_run_outcome(thread_id, error="The agent job could not be queued.")
+                return Response({"error": "The agent job could not be queued. Please retry."}, status=503)
+            return Response({"status": "queued", "thread_id": thread_id}, status=202)
+
         result = agent_service.run_agent_task(
             task, thread_id, repo_url, installation_id
         )
@@ -108,6 +122,20 @@ def agent_resume(request):
 
     try:
         agent_service.validate_owned_thread(request.user, thread_id)
+        from django.conf import settings
+
+        if settings.DEVPILOT_ASYNC_RUNS:
+            from .tasks import resume_agent_job
+
+            AgentRun.objects.filter(thread_id=thread_id).update(status="queued")
+            try:
+                resume_agent_job.delay(thread_id, decision)
+            except Exception:
+                logger.exception("Could not enqueue agent resume (thread_id=%s)", thread_id)
+                agent_service.record_run_outcome(thread_id, error="The resume job could not be queued.")
+                return Response({"error": "The resume job could not be queued. Please retry."}, status=503)
+            return Response({"status": "queued", "thread_id": thread_id}, status=202)
+
         result = agent_service.resume_agent_task(thread_id, decision)
     except agent_service.ThreadOwnershipError as e:
         return Response({"error": str(e)}, status=403)
