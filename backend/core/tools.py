@@ -1535,10 +1535,11 @@ def _build_test_command(command, workspace, mode=None):
         )
 
     workspace = Path(workspace).resolve()
+    sandbox_workspace = "/tmp/workspace"
     args = [
         prlimit,
         "--cpu=120:120",
-        "--as=2147483648:2147483648",
+        "--as=3221225472:3221225472",
         "--fsize=104857600:104857600",
         "--nofile=256:256",
         "--nproc=128:128",
@@ -1547,23 +1548,24 @@ def _build_test_command(command, workspace, mode=None):
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
-        "--ro-bind", "/usr", "/usr",
-    ]
-    for system_path in ("/etc", "/bin", "/lib", "/lib64"):
-        if Path(system_path).exists():
-            args.extend(["--ro-bind", system_path, system_path])
-
-    args.extend([
-        "--ro-bind", "/app", "/app",
-        "--bind", str(workspace), str(workspace),
+        # The container filesystem is read-only. Only a temporary directory
+        # and this run's workspace are writable inside the sandbox.
+        "--ro-bind", "/", "/",
+        "--tmpfs", "/tmp",
+        "--dir", sandbox_workspace,
+        "--bind", str(workspace), sandbox_workspace,
+        # Hide the shared workspace volume after binding only this run.
+        "--tmpfs", "/data",
+        "--tmpfs", "/home",
+        "--tmpfs", "/run",
+        "--tmpfs", "/var/tmp",
         "--proc", "/proc",
         "--dev", "/dev",
-        "--tmpfs", "/tmp",
-        "--chdir", str(workspace),
+        "--chdir", sandbox_workspace,
         "--clearenv",
         "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
-        "--setenv", "HOME", str(workspace / ".devpilot-home"),
-        "--setenv", "XDG_CACHE_HOME", str(workspace / ".devpilot-home" / ".cache"),
+        "--setenv", "HOME", sandbox_workspace + "/.devpilot-home",
+        "--setenv", "XDG_CACHE_HOME", sandbox_workspace + "/.devpilot-home/.cache",
         "--setenv", "CI", "true",
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
         "--",
