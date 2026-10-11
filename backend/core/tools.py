@@ -1581,6 +1581,80 @@ def _build_test_command(command, workspace, mode=None):
     return args
 
 
+_MAX_CAPTURE_BYTES = 80000
+
+
+def _run_bounded_subprocess(command, cwd, env, timeout=120, max_output_bytes=_MAX_CAPTURE_BYTES):
+    """Run a command while draining stdout/stderr without unbounded buffering."""
+    import signal
+    import threading
+
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=(os.name != "nt"),
+    )
+    buffers = {"stdout": [], "stderr": []}
+    counts = {"stdout": 0, "stderr": 0}
+    truncated = {"stdout": False, "stderr": False}
+
+    def drain(name, pipe):
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                break
+            remaining = max_output_bytes - counts[name]
+            if remaining > 0:
+                kept = chunk[:remaining]
+                buffers[name].append(kept)
+                counts[name] += len(kept)
+            if len(chunk) > max(remaining, 0):
+                truncated[name] = True
+
+    readers = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    timed_out = False
+    try:
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        return_code = process.wait()
+
+    for reader in readers:
+        reader.join(timeout=2)
+    for pipe in (process.stdout, process.stderr):
+        if pipe:
+            pipe.close()
+
+    def output(name):
+        value = b"".join(buffers[name]).decode("utf-8", errors="replace")
+        if truncated[name]:
+            value += "\\n...[capture truncated]"
+        return value
+
+    stdout, stderr = output("stdout"), output("stderr")
+    if timed_out:
+        raise subprocess.TimeoutExpired(
+            command, timeout, output=stdout, stderr=stderr
+        )
+    return subprocess.CompletedProcess(command, return_code, stdout, stderr)
+
+
 def _bounded_output(value):
     """Decode and cap command output before storing it in agent state."""
     if value is None:
@@ -1709,13 +1783,11 @@ def run_tests():
             logging.getLogger(__name__).warning(
                 "Running repository tests without a sandbox; use bubblewrap mode for untrusted code."
             )
-        result = subprocess.run(
+        result = _run_bounded_subprocess(
             execution_command,
             cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=120,
             env=_sanitized_env(workspace),
+            timeout=120,
         )
 
         return {
