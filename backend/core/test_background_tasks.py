@@ -1,4 +1,5 @@
 from unittest import mock
+import uuid
 
 from django.contrib.auth.models import User
 from django.test import TestCase
@@ -14,6 +15,7 @@ class BackgroundTaskTests(TestCase):
         )
         self.run = AgentRun.objects.create(
             user=self.user,
+            thread_id=uuid.uuid4(),
             task="test task",
             repo_url="https://github.com/example/repo",
             status="queued",
