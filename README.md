@@ -270,9 +270,9 @@ attempt, error type, and latency without printing raw exception messages.
 
 ### Background runs in Docker Compose
 
-The Compose stack now includes Redis and a Celery worker. Compose enables
+The Compose stack now includes Redis, a Celery worker, and Celery Beat for stale-run recovery. Compose enables
 `DEVPILOT_ASYNC_RUNS=True`; the API returns a run ID immediately and the React UI polls
-the persisted run status. The worker shares the workspace volume with the backend. Local
+the persisted run status. The worker shares the workspace volume with the backend. A recovery task marks queued/running jobs older than 60 minutes as interrupted. Repository test output is capped, and the test process receives a reduced environment with a private HOME and host credential sockets removed. Local
 development remains synchronous by default; set `DEVPILOT_ASYNC_RUNS=True` only when a
 Celery worker and broker are running.
 
