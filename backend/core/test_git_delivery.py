@@ -57,6 +57,26 @@ def test_commit_does_not_stage_unrecorded_files(repo):
     ).returncode != 0
 
 
+def test_commit_discards_pre_staged_unrelated_files(repo):
+    t.create_agent_branch.invoke({"branch_name": "devpilot/pre-staged"})
+    (repo / "approved.py").write_text("approved = True\n")
+    (repo / "unrelated.txt").write_text("unrelated\n")
+    subprocess.run(["git", "add", "unrelated.txt"], cwd=repo, check=True)
+    t._record_written("approved.py")
+
+    result = t.git_commit.invoke({"message": "commit approved file"})
+
+    assert result["status"] == "success"
+    changed = subprocess.run(
+        ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert changed == ["approved.py"]
+
+
 def test_commit_stages_only_recorded_files(repo):
     t.create_agent_branch.invoke({"branch_name": "devpilot/only-recorded"})
     (repo / "approved.py").write_text("approved = True\n")
