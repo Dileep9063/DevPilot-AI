@@ -85,6 +85,30 @@ services:
     volumes:
       - workspace:/data/workspace
 
+  beat:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DJANGO_DEBUG: "False"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
+      DJANGO_DB_HOST: db
+      DJANGO_DB_NAME: devpilot
+      DJANGO_DB_USER: devpilot
+      DJANGO_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      LANGGRAPH_POSTGRES_URI: postgresql://devpilot:${POSTGRES_PASSWORD}@db:5432/devpilot
+      DEVPILOT_ASYNC_RUNS: "True"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
+    entrypoint: ["celery"]
+    command: ["-A", "config", "beat", "--loglevel=INFO"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   frontend:
     build:
       context: ./frontend
