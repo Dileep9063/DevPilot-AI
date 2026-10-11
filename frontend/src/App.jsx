@@ -18,6 +18,14 @@ export default function App() {
   const [runs, setRuns] = useState([]);
   const activeStatus = result?.status === "queued" || result?.status === "running";
 
+  const loadRuns = useCallback(async () => {
+    try {
+      setRuns((await api.runs()).runs);
+    } catch {
+      /* history is non-critical; ignore */
+    }
+  }, []);
+
   // Poll persisted run state while a background worker processes the task.
   useEffect(() => {
     if (!threadId || !activeStatus || approval) return undefined;
@@ -46,14 +54,6 @@ export default function App() {
       clearInterval(timer);
     };
   }, [threadId, activeStatus, approval, loadRuns]);
-
-  const loadRuns = useCallback(async () => {
-    try {
-      setRuns((await api.runs()).runs);
-    } catch {
-      /* history is non-critical; ignore */
-    }
-  }, []);
 
   useEffect(() => {
     if (!authed) return undefined;
