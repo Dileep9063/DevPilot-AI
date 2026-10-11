@@ -37,6 +37,7 @@ def test_main_is_protected(repo):
 def test_commit_and_push(repo):
     t.create_agent_branch.invoke({"branch_name": "devpilot/y"})
     (repo / "a.py").write_text("x = 1\n")
+    t._record_written("a.py")
     assert t.git_commit.invoke({"message": "add a"})["status"] == "success"
     assert t.git_commit.invoke({"message": "again"})["status"] == "nothing_to_commit"
     assert t.git_push.invoke({})["status"] == "success"
@@ -60,6 +61,7 @@ def test_branch_and_commit_work_on_repo_with_no_commits(tmp_path):
     try:
         assert t.create_agent_branch.invoke({"branch_name": "devpilot/new"})["status"] == "success"
         (tmp_path / "a.py").write_text("x = 1\n")
+        t._record_written("a.py")
         assert t.git_commit.invoke({"message": "first commit"})["status"] == "success"
     finally:
         t.reset_workspace(token)
@@ -71,6 +73,7 @@ def test_push_to_github_remote_without_token_gives_clear_error(repo, monkeypatch
     _run("git", "remote", "set-url", "origin", "https://github.com/o/r.git", cwd=repo)
     t.create_agent_branch.invoke({"branch_name": "devpilot/z"})
     (repo / "a.py").write_text("x = 1\n")
+    t._record_written("a.py")
     t.git_commit.invoke({"message": "m"})
 
     result = t.git_push.invoke({})
