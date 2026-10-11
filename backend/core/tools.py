@@ -205,6 +205,9 @@ def _record_written(path):
 def _stage_changes(workspace):
     written = _read_written(workspace)
 
+    # Clear any pre-existing index entries first. Repository tests/build hooks
+    # may run `git add`; never let those staged files sneak into an agent commit.
+    _git(["reset", "--quiet"], workspace)
     if written:
         _git(["add", "--", *written], workspace)
     # Fail closed: never stage arbitrary repository changes when the agent
