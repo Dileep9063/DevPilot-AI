@@ -119,3 +119,26 @@ def test_usage_logging_handles_missing_token_metadata(caplog):
     line = next(record.getMessage() for record in caplog.records if "LLM usage:" in record.getMessage())
     assert "input_tokens=unknown" in line
     assert "output_tokens=unknown" in line
+
+
+
+def test_cost_is_unknown_when_provider_rates_are_not_configured(monkeypatch, caplog):
+    class UsageResult:
+        usage_metadata = {"input_tokens": 100, "output_tokens": 50}
+        response_metadata = {"model_name": "test-model"}
+
+    class UsageFake(Fake):
+        def invoke(self, messages):
+            self.calls.append(self.name)
+            return UsageResult()
+
+    monkeypatch.delenv("LLM_COST_TEST_INPUT_PER_1M", raising=False)
+    monkeypatch.delenv("LLM_COST_TEST_OUTPUT_PER_1M", raising=False)
+    with caplog.at_level("INFO", logger="core.llm_providers"):
+        lp.invoke_with_fallback(
+            ["hello"], providers=[("test", UsageFake("test"))], retries=0, sleep=NOSLEEP
+        )
+    line = next(record.getMessage() for record in caplog.records if "LLM usage:" in record.getMessage())
+    assert "input_tokens=100" in line
+    assert "output_tokens=50" in line
+    assert "estimated_cost_usd=unknown" in line
