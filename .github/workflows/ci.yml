@@ -53,6 +53,8 @@ jobs:
         run: python manage.py test core
       - name: Run pytest integration suites
         run: pytest core/test_git_delivery.py core/test_llm_fallback.py
+      - name: Benchmark labeled code search
+        run: python scripts/benchmark_code_search.py . --repeats 1 --labels scripts/code_search_labels.example.json
 
   frontend:
     runs-on: ubuntu-latest
