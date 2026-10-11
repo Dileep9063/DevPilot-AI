@@ -181,10 +181,17 @@ def invoke_with_fallback(
                 input_tokens = usage.get("input_tokens", token_usage.get("prompt_tokens"))
                 output_tokens = usage.get("output_tokens", token_usage.get("completion_tokens"))
                 estimated_cost = None
-                if isinstance(input_tokens, (int, float)) and isinstance(output_tokens, (int, float)):
+                input_rate_setting = os.environ.get(f"LLM_COST_{name.upper()}_INPUT_PER_1M")
+                output_rate_setting = os.environ.get(f"LLM_COST_{name.upper()}_OUTPUT_PER_1M")
+                if (
+                    isinstance(input_tokens, (int, float))
+                    and isinstance(output_tokens, (int, float))
+                    and input_rate_setting is not None
+                    and output_rate_setting is not None
+                ):
                     try:
-                        input_rate = max(0.0, float(os.environ.get(f"LLM_COST_{name.upper()}_INPUT_PER_1M", "0")))
-                        output_rate = max(0.0, float(os.environ.get(f"LLM_COST_{name.upper()}_OUTPUT_PER_1M", "0")))
+                        input_rate = max(0.0, float(input_rate_setting))
+                        output_rate = max(0.0, float(output_rate_setting))
                         estimated_cost = (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
                     except (TypeError, ValueError):
                         estimated_cost = None
