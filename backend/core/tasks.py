@@ -49,3 +49,30 @@ def resume_agent_job(thread_id, decision):
         agent_service.record_run_outcome(thread_id, error="The agent could not resume this run. Check server logs for details.")
     finally:
         close_old_connections()
+
+
+@shared_task(ignore_result=True, acks_late=False)
+def recover_stale_agent_runs():
+    """Mark queued/running jobs abandoned by a crashed worker as interrupted."""
+    from datetime import timedelta
+    from django.utils import timezone
+
+    close_old_connections()
+    try:
+        cutoff = timezone.now() - timedelta(minutes=60)
+        stale_runs = AgentRun.objects.filter(
+            status__in=["queued", "running"],
+            updated_at__lt=cutoff,
+        )
+        count = stale_runs.update(
+            status="error",
+            summary=(
+                "This run was interrupted because its worker did not finish "
+                "within the recovery window. Please start a new run."
+            ),
+        )
+        if count:
+            logger.warning("Marked %s stale DevPilot runs as interrupted", count)
+        return count
+    finally:
+        close_old_connections()
