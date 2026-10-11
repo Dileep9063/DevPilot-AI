@@ -142,5 +142,10 @@ class BoundedTestOutputTests(SimpleTestCase):
                 timeout=15,
                 max_output_bytes=1024,
             )
+        if result.returncode != 0 and "Failed RTM_NEWADDR: Operation not permitted" in result.stderr:
+            self.skipTest(
+                "Runner/container cannot configure isolated network namespace; "
+                "run this integration test on a host that permits Bubblewrap namespaces."
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("sandbox-ok", result.stdout)
