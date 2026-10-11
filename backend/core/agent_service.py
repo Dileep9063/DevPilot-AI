@@ -14,7 +14,7 @@ from core.agent import agent
 from django.conf import settings
 
 from core import github_app
-from core.tools import github_auth_args
+from core.tools import github_auth_args, set_github_token, reset_github_token
 
 WORKSPACE_ROOT = Path(settings.DEVPILOT_WORKSPACE_ROOT).resolve()
 
@@ -241,24 +241,30 @@ def run_agent_task(
         clone_token,
     )
 
-    return agent.invoke(
-        _initial_state(
-            task,
-            workspace_path,
-            thread_id,
-            installation_id,
-        ),
-        {
-            "configurable": {
-                "thread_id": thread_id,
-            }
-        },
-    )
+    token_context = set_github_token(clone_token) if clone_token else None
+    try:
+        return agent.invoke(
+            _initial_state(
+                task,
+                workspace_path,
+                thread_id,
+                installation_id,
+            ),
+            {
+                "configurable": {
+                    "thread_id": thread_id,
+                }
+            },
+        )
+    finally:
+        if token_context is not None:
+            reset_github_token(token_context)
 
 
 def resume_agent_task(
     thread_id: str,
     decision: str,
+    installation_id: int = 0,
 ) -> dict:
     workspace_path = _workspace_for_thread(thread_id)
 
@@ -279,14 +285,26 @@ def resume_agent_task(
             "Repository workspace is invalid or missing"
         )
 
-    return agent.invoke(
-        Command(resume=decision),
-        {
-            "configurable": {
-                "thread_id": thread_id,
-            }
-        },
-    )
+    token = None
+    if installation_id:
+        from core.models import AgentRun
+        run = AgentRun.objects.get(thread_id=uuid.UUID(str(thread_id)))
+        _, repo_name = _validate_github_url(run.repo_url)
+        token = github_app.installation_token(installation_id, repo_name)
+
+    token_context = set_github_token(token) if token else None
+    try:
+        return agent.invoke(
+            Command(resume=decision),
+            {
+                "configurable": {
+                    "thread_id": thread_id,
+                }
+            },
+        )
+    finally:
+        if token_context is not None:
+            reset_github_token(token_context)
 
 
 def _serialize_messages(messages) -> list:
