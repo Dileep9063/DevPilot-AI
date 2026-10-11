@@ -307,4 +307,6 @@ Run a baseline for the current BM25-style keyword search from the repository roo
 python backend/scripts/benchmark_code_search.py ./path/to/repository --repeats 5
 ```
 
+For DevPilot's example labeled query set, add `--labels backend/scripts/code_search_labels.example.json`. This reports hit@3 against expected path substrings. Review and tune the labels for the target repository before treating the score as a relevance metric.
+
 Save baseline results before changing retrieval. The script reports latency and top paths; relevance still needs a manually labeled query set before comparing lexical search with hybrid/semantic retrieval.
