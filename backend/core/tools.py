@@ -1547,6 +1547,12 @@ def _build_test_command(command, workspace, mode=None):
 
     workspace = Path(workspace).resolve()
     sandbox_workspace = "/tmp/workspace"
+    try:
+        tmpfs_bytes = int(os.environ.get("DEVPILOT_TEST_TMPFS_BYTES", 512 * 1024 * 1024))
+    except (TypeError, ValueError):
+        tmpfs_bytes = 512 * 1024 * 1024
+    # Clamp to a safe finite range so the sandbox's writable tmpfs is bounded.
+    tmpfs_bytes = max(64 * 1024 * 1024, min(tmpfs_bytes, 2 * 1024 * 1024 * 1024))
     args = [
         prlimit,
         "--cpu=120:120",
@@ -1559,6 +1565,7 @@ def _build_test_command(command, workspace, mode=None):
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
+        "--size", str(tmpfs_bytes),
     ]
     # Mount the runtime read-only; the app process runs as an unprivileged user.
     for system_path in ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/app", "/opt"):
