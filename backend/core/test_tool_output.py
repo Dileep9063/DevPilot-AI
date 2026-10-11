@@ -63,7 +63,7 @@ class BoundedTestOutputTests(SimpleTestCase):
         self.assertIn("--ro-bind", command)
         self.assertIn("--bind", command)
         self.assertIn("--cpu=120:120", command)
-        self.assertIn("--as=2147483648:2147483648", command)
+        self.assertIn("--as=3221225472:3221225472", command)
         self.assertEqual(command[-2:], ["npm", "test"])
 
     def test_bubblewrap_mode_fails_closed_without_prerequisites(self):
