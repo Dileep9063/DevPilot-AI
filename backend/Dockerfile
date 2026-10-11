@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
 # git: clone/commit/push repositories.  nodejs+npm: run `npm test` / `npm run build`
 # in cloned JavaScript projects.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git nodejs npm ca-certificates \
+    && apt-get install -y --no-install-recommends git nodejs npm ca-certificates bubblewrap util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
