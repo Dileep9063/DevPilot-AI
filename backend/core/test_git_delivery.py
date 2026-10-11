@@ -50,11 +50,11 @@ def test_commit_does_not_stage_unrecorded_files(repo):
     result = t.git_commit.invoke({"message": "should not include unrelated file"})
 
     assert result["status"] == "nothing_to_commit"
-    assert not subprocess.run(
+    assert subprocess.run(
         ["git", "cat-file", "-e", "HEAD:unrelated.txt"],
         cwd=repo,
         capture_output=True,
-    ).returncode
+    ).returncode != 0
 
 
 def test_commit_stages_only_recorded_files(repo):
