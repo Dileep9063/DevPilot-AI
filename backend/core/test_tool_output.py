@@ -4,7 +4,7 @@ from unittest import mock
 
 from django.test import SimpleTestCase
 
-from core.tools import _MAX_TEST_OUTPUT_CHARS, _bounded_output, _sanitized_env
+from core.tools import _MAX_TEST_OUTPUT_CHARS, _bounded_output, _build_test_command, _sanitized_env
 
 
 class BoundedTestOutputTests(SimpleTestCase):
@@ -43,3 +43,38 @@ class BoundedTestOutputTests(SimpleTestCase):
         self.assertNotIn("DOCKER_HOST", env)
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(env["HOME"], os.path.join(workspace, ".devpilot-home"))
+
+
+    def test_unsafe_local_mode_preserves_command_explicitly(self):
+        command = ["python", "-m", "pytest"]
+        self.assertEqual(
+            _build_test_command(command, "/tmp/workspace", mode="unsafe-local"),
+            command,
+        )
+
+    def test_bubblewrap_mode_clears_environment_and_disables_network(self):
+        with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+            command = _build_test_command(
+                ["npm", "test"], "/tmp/workspace", mode="bubblewrap"
+            )
+
+        self.assertIn("--unshare-all", command)
+        self.assertIn("--clearenv", command)
+        self.assertIn("--ro-bind", command)
+        self.assertIn("--bind", command)
+        self.assertIn("--cpu=120:120", command)
+        self.assertIn("--as=2147483648:2147483648", command)
+        self.assertEqual(command[-2:], ["npm", "test"])
+
+    def test_bubblewrap_mode_fails_closed_without_prerequisites(self):
+        with mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                _build_test_command(
+                    ["npm", "test"], "/tmp/workspace", mode="bubblewrap"
+                )
+
+    def test_unknown_sandbox_mode_does_not_execute_unsandboxed(self):
+        with self.assertRaises(ValueError):
+            _build_test_command(
+                ["npm", "test"], "/tmp/workspace", mode="disabled"
+            )
