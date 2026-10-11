@@ -1548,17 +1548,24 @@ def _build_test_command(command, workspace, mode=None):
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
-        # The container filesystem is read-only. Only a temporary directory
-        # and this run's workspace are writable inside the sandbox.
-        "--ro-bind", "/", "/",
+    ]
+    # Mount the runtime read-only; the app process runs as an unprivileged user.
+    for system_path in ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/app", "/opt", "/var"):
+        if Path(system_path).exists():
+            args.extend(["--ro-bind", system_path, system_path])
+
+    args.extend([
         "--tmpfs", "/tmp",
         "--dir", sandbox_workspace,
         "--bind", str(workspace), sandbox_workspace,
-        # Hide the shared workspace volume after binding only this run.
-        "--tmpfs", "/data",
-        "--tmpfs", "/home",
-        "--tmpfs", "/run",
-        "--tmpfs", "/var/tmp",
+    ])
+    # Hide other runs and common per-user/runtime write locations. The active
+    # workspace is already bind-mounted elsewhere before /data is hidden.
+    for hidden_path in ("/data", "/home", "/root", "/run", "/var/tmp", "/mnt", "/media", "/srv"):
+        if Path(hidden_path).exists():
+            args.extend(["--tmpfs", hidden_path])
+
+    args.extend([
         "--proc", "/proc",
         "--dev", "/dev",
         "--chdir", sandbox_workspace,
@@ -1570,7 +1577,7 @@ def _build_test_command(command, workspace, mode=None):
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
         "--",
         *command,
-    ]
+    ])
     return args
 
 
