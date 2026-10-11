@@ -1,11 +1,14 @@
+from datetime import timedelta
 from unittest import mock
 import uuid
+
+from django.utils import timezone
 
 from django.contrib.auth.models import User
 from django.test import TestCase
 
 from core.models import AgentRun
-from core.tasks import run_agent_job
+from core.tasks import recover_stale_agent_runs, run_agent_job
 
 
 class BackgroundTaskTests(TestCase):
@@ -60,3 +63,24 @@ class BackgroundTaskTests(TestCase):
             )
 
         execute.assert_not_called()
+
+    @mock.patch("core.tasks.close_old_connections")
+    def test_stale_run_recovery_marks_abandoned_runs_as_error(self, _close_connections):
+        stale_time = timezone.now() - timedelta(hours=2)
+        AgentRun.objects.filter(pk=self.run.pk).update(updated_at=stale_time)
+        recent = AgentRun.objects.create(
+            user=self.user,
+            thread_id=uuid.uuid4(),
+            task="recent task",
+            repo_url="https://github.com/example/repo",
+            status="queued",
+        )
+
+        recovered = recover_stale_agent_runs.run()
+
+        self.assertEqual(recovered, 1)
+        self.run.refresh_from_db()
+        recent.refresh_from_db()
+        self.assertEqual(self.run.status, "error")
+        self.assertIn("interrupted", self.run.summary.lower())
+        self.assertEqual(recent.status, "queued")
