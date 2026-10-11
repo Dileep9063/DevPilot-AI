@@ -75,7 +75,8 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
-    command: ["celery", "-A", "config", "worker", "--loglevel=INFO", "--concurrency=1"]
+    entrypoint: ["celery"]
+    command: ["-A", "config", "worker", "--loglevel=INFO", "--concurrency=1"]
     depends_on:
       db:
         condition: service_healthy
