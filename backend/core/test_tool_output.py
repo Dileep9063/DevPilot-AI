@@ -1,10 +1,12 @@
 import os
+import subprocess
+import sys
 import tempfile
 from unittest import mock
 
 from django.test import SimpleTestCase
 
-from core.tools import _MAX_TEST_OUTPUT_CHARS, _bounded_output, _build_test_command, _sanitized_env
+from core.tools import _MAX_TEST_OUTPUT_CHARS, _bounded_output, _build_test_command, _run_bounded_subprocess, _sanitized_env
 
 
 class BoundedTestOutputTests(SimpleTestCase):
@@ -78,3 +80,28 @@ class BoundedTestOutputTests(SimpleTestCase):
             _build_test_command(
                 ["npm", "test"], "/tmp/workspace", mode="disabled"
             )
+
+
+    def test_subprocess_output_is_bounded_while_running(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            result = _run_bounded_subprocess(
+                [sys.executable, "-c", "print('x' * 10000)"],
+                cwd=workspace,
+                env={"PATH": os.environ.get("PATH", "")},
+                timeout=10,
+                max_output_bytes=128,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertLess(len(result.stdout), 200)
+        self.assertIn("capture truncated", result.stdout)
+
+    def test_subprocess_timeout_kills_the_process(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _run_bounded_subprocess(
+                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    cwd=workspace,
+                    env={"PATH": os.environ.get("PATH", "")},
+                    timeout=0.1,
+                    max_output_bytes=128,
+                )
