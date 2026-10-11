@@ -130,20 +130,34 @@ PROTECTED_BRANCHES = {"main", "master"}
 _SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "URI", "DATABASE_URL")
 
 
-def _sanitized_env():
+def _sanitized_env(workspace=None):
     """
-    Environment for running a cloned repository's tests.
+    Reduced environment for repository tests.
 
-    Strips anything that looks like a secret (API keys, GITHUB_TOKEN,
-    DB URIs) so untrusted repo code cannot read DevPilot's credentials.
+    This is defense in depth, not a sandbox: untrusted code can still access
+    files and resources available to the process. Run untrusted repos only in
+    a separately isolated execution environment.
     """
+    blocked_names = {
+        "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_ASKPASS", "SSH_ASKPASS",
+        "DOCKER_HOST", "DOCKER_CONFIG", "KUBECONFIG", "GPG_AGENT_INFO",
+    }
     env = {
         k: v
         for k, v in os.environ.items()
-        if not any(m in k.upper() for m in _SECRET_MARKERS)
+        if k.upper() not in blocked_names
+        and not any(m in k.upper() for m in _SECRET_MARKERS)
     }
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["CI"] = "true"  # keep npm test runners out of watch mode
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    if workspace is not None:
+        isolated_home = Path(workspace) / ".devpilot-home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(isolated_home)
+        env["XDG_CONFIG_HOME"] = str(isolated_home / ".config")
+        env["XDG_CACHE_HOME"] = str(isolated_home / ".cache")
     return env
 
 
@@ -1622,7 +1636,7 @@ def run_tests():
             capture_output=True,
             text=True,
             timeout=120,
-            env=_sanitized_env(),
+            env=_sanitized_env(workspace),
         )
 
         return {
