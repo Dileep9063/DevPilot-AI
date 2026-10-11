@@ -255,9 +255,7 @@ python manage.py cleanup_workspaces --days 7
 
 ## Known limitations / next steps
 
-- Runs are synchronous: the HTTP request stays open while the agent
-  works. Streaming progress or a background worker would improve UX.
-- Retrieval is keyword-based; embeddings could be added for large repos.
+- Retrieval is keyword-based; use the benchmark below before deciding whether hybrid/semantic retrieval is worth the complexity.
 - No fork workflow: pushing requires write access to the target repository.
 
 
@@ -290,12 +288,7 @@ python manage.py test core
 pytest core/test_git_delivery.py core/test_llm_fallback.py core/test_background_tasks.py
 ```
 
-**Security limitation:** These changes do not yet provide a hardened sandbox for arbitrary
-repository code. The current test runner still executes project commands inside the backend
-container, albeit with a reduced environment and an unprivileged container user. Do not run
-untrusted repositories in a public multi-user deployment until a separate execution sandbox
-with strict resource, filesystem, privilege, and network controls has been implemented and
-tested.
+**Security limitation:** Bubblewrap isolation is defense in depth, not a guarantee against every kernel/container escape. Disk-usage quotas and adversarial sandbox escape testing remain outstanding. Do not expose arbitrary repository execution publicly until a security review and adversarial tests are complete.
 
 
 ## Repository test execution safety
