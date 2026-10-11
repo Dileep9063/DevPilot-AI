@@ -51,7 +51,8 @@ def test_all_fail_reports_every_error():
     a, b = Fake("a", fail="boom A"), Fake("b", fail="boom B")
     with pytest.raises(lp.AllProvidersFailed) as e:
         lp.invoke_with_fallback(["hi"], providers=[("a", a), ("b", b)], retries=0, sleep=NOSLEEP)
-    assert "boom A" in str(e.value) and "boom B" in str(e.value)
+    assert "a: Exception" in str(e.value) and "b: Exception" in str(e.value)
+    assert "boom A" not in str(e.value) and "boom B" not in str(e.value)
 
 
 def test_tools_are_bound():
