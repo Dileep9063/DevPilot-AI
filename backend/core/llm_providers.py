@@ -12,8 +12,13 @@ Environment:
     LLM_RETRIES          retries per provider on transient errors (default 1)
 """
 
+import logging
 import os
+import random
 import time
+
+logger = logging.getLogger(__name__)
+MAX_RETRIES = 3
 
 
 TRANSIENT_MARKERS = (
@@ -111,12 +116,12 @@ def get_providers(refresh: bool = False):
     for name in order:
         factory = FACTORIES.get(name)
         if factory is None:
-            print(f"LLM: unknown provider '{name}' ignored")
+            logger.warning("Unknown LLM provider ignored: %s", name)
             continue
         try:
             llm = factory()
         except Exception as exc:  # missing package, bad config, ...
-            print(f"LLM: provider '{name}' unavailable: {exc!r}")
+            logger.warning("LLM provider unavailable during initialization: %s (%s)", name, type(exc).__name__)
             continue
         if llm is not None:
             providers.append((name, llm))
@@ -153,7 +158,12 @@ def invoke_with_fallback(
         )
 
     if retries is None:
-        retries = int(os.environ.get("LLM_RETRIES", "1"))
+        try:
+            retries = int(os.environ.get("LLM_RETRIES", "1"))
+        except (TypeError, ValueError):
+            retries = 1
+    # Bound retries so a bad environment setting cannot create an unbounded delay.
+    retries = max(0, min(int(retries), MAX_RETRIES))
 
     errors = []
 
@@ -161,17 +171,29 @@ def invoke_with_fallback(
         runnable = llm.bind_tools(tools) if tools else llm
 
         for attempt in range(retries + 1):
+            started = time.monotonic()
             try:
-                return runnable.invoke(messages)
+                result = runnable.invoke(messages)
+                logger.info(
+                    "LLM provider succeeded: provider=%s attempt=%s latency_ms=%s",
+                    name, attempt + 1, round((time.monotonic() - started) * 1000),
+                )
+                return result
 
             except Exception as exc:
-                print(f"LLM ERROR [{name}] attempt {attempt + 1}:", repr(exc))
-
+                logger.warning(
+                    "LLM provider failed: provider=%s attempt=%s error_type=%s transient=%s",
+                    name, attempt + 1, type(exc).__name__, is_transient_provider_error(exc),
+                )
                 if is_transient_provider_error(exc) and attempt < retries:
-                    sleep(1.5 * (attempt + 1))
+                    # Exponential backoff with jitter, capped to avoid long waits.
+                    delay = min(8.0, 1.5 * (2 ** attempt))
+                    sleep(delay + random.uniform(0, delay * 0.25))
                     continue
 
-                errors.append(f"{name}: {exc}")
+                # Avoid propagating provider exception text, which can contain
+                # request details or credentials, into API/error responses.
+                errors.append(f"{name}: {type(exc).__name__}")
                 break
 
     raise AllProvidersFailed(
