@@ -1,6 +1,10 @@
+import os
+import tempfile
+from unittest import mock
+
 from django.test import SimpleTestCase
 
-from core.tools import _MAX_TEST_OUTPUT_CHARS, _bounded_output
+from core.tools import _MAX_TEST_OUTPUT_CHARS, _bounded_output, _sanitized_env
 
 
 class BoundedTestOutputTests(SimpleTestCase):
@@ -17,3 +21,25 @@ class BoundedTestOutputTests(SimpleTestCase):
         self.assertTrue(result.startswith("x" * _MAX_TEST_OUTPUT_CHARS))
         self.assertIn("truncated 123 characters", result)
         self.assertLess(len(result), len(output) + 100)
+
+    def test_sanitized_environment_drops_secrets_and_host_access_sockets(self):
+        source = {
+            "PATH": "/usr/bin",
+            "GITHUB_TOKEN": "do-not-leak",
+            "DATABASE_URL": "postgres://secret",
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+            "DOCKER_HOST": "unix:///var/run/docker.sock",
+            "LANG": "C.UTF-8",
+        }
+        with tempfile.TemporaryDirectory() as workspace:
+            with mock.patch.dict(os.environ, source, clear=True):
+                env = _sanitized_env(workspace)
+
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertEqual(env["LANG"], "C.UTF-8")
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotIn("DATABASE_URL", env)
+        self.assertNotIn("SSH_AUTH_SOCK", env)
+        self.assertNotIn("DOCKER_HOST", env)
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(env["HOME"], os.path.join(workspace, ".devpilot-home"))
