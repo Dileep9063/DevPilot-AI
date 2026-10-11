@@ -110,3 +110,11 @@ CELERY_TASK_IGNORE_RESULT = True
 CELERY_TASK_TRACK_STARTED = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_ACKS_LATE = False
+
+# Periodically detect jobs abandoned by a crashed worker.
+CELERY_BEAT_SCHEDULE = {
+    "recover-stale-agent-runs-every-five-minutes": {
+        "task": "core.tasks.recover_stale_agent_runs",
+        "schedule": 300.0,
+    },
+}
