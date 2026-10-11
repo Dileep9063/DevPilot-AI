@@ -207,12 +207,9 @@ def _stage_changes(workspace):
 
     if written:
         _git(["add", "--", *written], workspace)
-    else:
-        # No record: stage everything except build output.
-        _git(
-            ["add", "-A", "--", ".", *[f":(exclude){d}" for d in BUILD_DIRS]],
-            workspace,
-        )
+    # Fail closed: never stage arbitrary repository changes when the agent
+    # has not recorded an approved write. This prevents tests, build tools,
+    # or pre-existing user changes from being committed accidentally.
 
 
 
