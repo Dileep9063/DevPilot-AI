@@ -102,3 +102,19 @@ SIMPLE_JWT = {
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
+
+# Optional background execution settings.
+DEVPILOT_ASYNC_RUNS = os.getenv("DEVPILOT_ASYNC_RUNS", "False").lower() == "true"
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+CELERY_TASK_IGNORE_RESULT = True
+CELERY_TASK_TRACK_STARTED = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_ACKS_LATE = False
+
+# Periodically detect jobs abandoned by a crashed worker.
+CELERY_BEAT_SCHEDULE = {
+    "recover-stale-agent-runs-every-five-minutes": {
+        "task": "core.tasks.recover_stale_agent_runs",
+        "schedule": 300.0,
+    },
+}

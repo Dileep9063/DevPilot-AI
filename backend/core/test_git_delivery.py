@@ -37,9 +37,63 @@ def test_main_is_protected(repo):
 def test_commit_and_push(repo):
     t.create_agent_branch.invoke({"branch_name": "devpilot/y"})
     (repo / "a.py").write_text("x = 1\n")
+    t._record_written("a.py")
     assert t.git_commit.invoke({"message": "add a"})["status"] == "success"
     assert t.git_commit.invoke({"message": "again"})["status"] == "nothing_to_commit"
     assert t.git_push.invoke({})["status"] == "success"
+
+
+def test_commit_does_not_stage_unrecorded_files(repo):
+    t.create_agent_branch.invoke({"branch_name": "devpilot/unrecorded"})
+    (repo / "unrelated.txt").write_text("do not commit\n")
+
+    result = t.git_commit.invoke({"message": "should not include unrelated file"})
+
+    assert result["status"] == "nothing_to_commit"
+    assert subprocess.run(
+        ["git", "cat-file", "-e", "HEAD:unrelated.txt"],
+        cwd=repo,
+        capture_output=True,
+    ).returncode != 0
+
+
+def test_commit_discards_pre_staged_unrelated_files(repo):
+    t.create_agent_branch.invoke({"branch_name": "devpilot/pre-staged"})
+    (repo / "approved.py").write_text("approved = True\n")
+    (repo / "unrelated.txt").write_text("unrelated\n")
+    subprocess.run(["git", "add", "unrelated.txt"], cwd=repo, check=True)
+    t._record_written("approved.py")
+
+    result = t.git_commit.invoke({"message": "commit approved file"})
+
+    assert result["status"] == "success"
+    changed = subprocess.run(
+        ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert changed == ["approved.py"]
+
+
+def test_commit_stages_only_recorded_files(repo):
+    t.create_agent_branch.invoke({"branch_name": "devpilot/only-recorded"})
+    (repo / "approved.py").write_text("approved = True\n")
+    (repo / "unrelated.txt").write_text("unrelated\n")
+    t._record_written("approved.py")
+
+    result = t.git_commit.invoke({"message": "commit approved file"})
+
+    assert result["status"] == "success"
+    changed = subprocess.run(
+        ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert changed == ["approved.py"]
 
 
 def test_pr_requires_token(repo, monkeypatch):
@@ -60,6 +114,7 @@ def test_branch_and_commit_work_on_repo_with_no_commits(tmp_path):
     try:
         assert t.create_agent_branch.invoke({"branch_name": "devpilot/new"})["status"] == "success"
         (tmp_path / "a.py").write_text("x = 1\n")
+        t._record_written("a.py")
         assert t.git_commit.invoke({"message": "first commit"})["status"] == "success"
     finally:
         t.reset_workspace(token)
@@ -71,6 +126,7 @@ def test_push_to_github_remote_without_token_gives_clear_error(repo, monkeypatch
     _run("git", "remote", "set-url", "origin", "https://github.com/o/r.git", cwd=repo)
     t.create_agent_branch.invoke({"branch_name": "devpilot/z"})
     (repo / "a.py").write_text("x = 1\n")
+    t._record_written("a.py")
     t.git_commit.invoke({"message": "m"})
 
     result = t.git_push.invoke({})

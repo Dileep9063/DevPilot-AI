@@ -16,6 +16,7 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [runs, setRuns] = useState([]);
+  const activeStatus = result?.status === "queued" || result?.status === "running";
 
   const loadRuns = useCallback(async () => {
     try {
@@ -24,6 +25,35 @@ export default function App() {
       /* history is non-critical; ignore */
     }
   }, []);
+
+  // Poll persisted run state while a background worker processes the task.
+  useEffect(() => {
+    if (!threadId || !activeStatus || approval) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const detail = await api.runDetail(threadId);
+        if (cancelled) return;
+        if (detail.status === "waiting_for_approval" && detail.approval_request) {
+          setApproval(detail.approval_request);
+          setResult(null);
+          loadRuns();
+        } else if (detail.status !== "queued" && detail.status !== "running") {
+          setApproval(null);
+          setResult({ status: detail.status, pr_url: detail.pr_url, final_result: detail.summary });
+          loadRuns();
+        }
+      } catch {
+        // Keep the active run visible during transient polling failures.
+      }
+    };
+    const timer = setInterval(poll, 2000);
+    poll();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [threadId, activeStatus, approval, loadRuns]);
 
   useEffect(() => {
     if (!authed) return undefined;
@@ -113,7 +143,7 @@ export default function App() {
 
   if (!authed) return <AuthForm onAuthed={() => setAuthed(true)} />;
 
-  const busy = loading;
+  const busy = loading || activeStatus;
   const waiting = !!approval;
 
   return (
@@ -144,7 +174,7 @@ export default function App() {
         />
         <div className="actions">
           <button className="primary" disabled={busy || waiting || !repoUrl.trim() || !task.trim()}>
-            {busy ? "Agent working…" : "Run agent"}
+            {activeStatus ? "Agent working…" : loading ? "Submitting…" : "Run agent"}
           </button>
           {(result || waiting) && !busy && (
             <button type="button" className="link" onClick={reset}>Start over</button>
@@ -153,7 +183,7 @@ export default function App() {
         {threadId && <p className="muted">Run: <code>{threadId}</code></p>}
       </form>
 
-      {busy && <div className="card"><p className="muted">Working — this can take a minute while the agent reads, edits and tests…</p></div>}
+      {busy && <div className="card"><p className="muted">{activeStatus ? "Agent queued or running — checking progress automatically…" : "Submitting your task…"}</p></div>}
       {approval && !busy && <ApprovalCard request={approval} loading={busy} onDecide={decide} />}
       {result && !busy && <ResultCard result={result} />}
 

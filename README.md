@@ -255,7 +255,58 @@ python manage.py cleanup_workspaces --days 7
 
 ## Known limitations / next steps
 
-- Runs are synchronous: the HTTP request stays open while the agent
-  works. Streaming progress or a background worker would improve UX.
-- Retrieval is keyword-based; embeddings could be added for large repos.
+- Retrieval is keyword-based; use the benchmark below before deciding whether hybrid/semantic retrieval is worth the complexity.
 - No fork workflow: pushing requires write access to the target repository.
+
+
+## Security and background execution updates
+
+The security-hardening branch adds bounded API input validation, safer API error responses,
+GitHub URL validation, and fail-closed Git staging so only paths recorded by the agent are
+staged for commits. LLM provider retries are bounded and provider logs record provider,
+attempt, error type, and latency without printing raw exception messages.
+
+### Background runs in Docker Compose
+
+The Compose stack now includes Redis, a Celery worker, and Celery Beat for stale-run recovery. Compose enables
+`DEVPILOT_ASYNC_RUNS=True`; the API returns a run ID immediately and the React UI polls
+the persisted run status. The worker shares the workspace volume with the backend. A recovery task marks queued/running jobs older than 60 minutes as interrupted. Repository test output is capped, and the test process receives a reduced environment with a private HOME and host credential sockets removed. Local
+development remains synchronous by default; set `DEVPILOT_ASYNC_RUNS=True` only when a
+Celery worker and broker are running.
+
+Start the stack with:
+
+```bash
+docker compose up -d --build
+docker compose logs -f backend worker
+```
+
+Run the offline test suites in the backend environment:
+
+```bash
+python manage.py test core
+pytest core/test_git_delivery.py core/test_llm_fallback.py core/test_background_tasks.py
+```
+
+**Security limitation:** Bubblewrap isolation is defense in depth, not a guarantee against every kernel/container escape. Disk-usage quotas and adversarial sandbox escape testing remain outstanding. Do not expose arbitrary repository execution publicly until a security review and adversarial tests are complete.
+
+
+## Repository test execution safety
+
+The Docker Compose backend and worker select `DEVPILOT_TEST_SANDBOX=bubblewrap`. In that mode, test/build commands run with network and other namespaces unshared, a read-only container filesystem, only the current run's workspace writable, a cleared child environment, and CPU/address-space/file-size/process/file-descriptor limits. If Bubblewrap or `prlimit` is unavailable, execution fails closed; it never silently falls back to an unsandboxed command. The sandbox is defense in depth, not a guarantee against every kernel/container escape, and disk-usage quotas are not currently enforced. Do not expose arbitrary-code execution publicly without further security review and adversarial testing.
+
+For trusted local development outside Docker Compose, set `DEVPILOT_TEST_SANDBOX=unsafe-local` explicitly. This executes commands without OS sandbox isolation and must not be used for untrusted repositories.
+
+## LLM usage and search benchmark
+
+Successful LLM calls log provider, model, latency, available input/output token counts, and an estimated USD cost. Configure `LLM_COST_<PROVIDER>_INPUT_PER_1M` and `LLM_COST_<PROVIDER>_OUTPUT_PER_1M` using the provider's current pricing. If rates are missing or token metadata is unavailable, cost is logged as unknown. This is an estimate, not a persisted billing ledger.
+
+Run a baseline for the current BM25-style keyword search from the repository root:
+
+```bash
+python backend/scripts/benchmark_code_search.py ./path/to/repository --repeats 5
+```
+
+For DevPilot's example labeled query set, add `--labels backend/scripts/code_search_labels.example.json`. This reports hit@3 against expected path substrings. Review and tune the labels for the target repository before treating the score as a relevance metric.
+
+Save baseline results before changing retrieval. The script reports latency and top paths; relevance still needs a manually labeled query set before comparing lexical search with hybrid/semantic retrieval.

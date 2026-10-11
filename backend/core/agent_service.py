@@ -34,8 +34,15 @@ def _workspace_for_thread(thread_id: str) -> Path:
 def _validate_github_url(repo_url: str) -> tuple[str, str]:
     parsed = urlparse(repo_url.strip())
 
-    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
-        raise ValueError("repo_url must be a GitHub HTTPS repository URL")
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.lower() != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("repo_url must be a plain GitHub HTTPS repository URL")
 
     match = re.fullmatch(
         r"/([^/]+)/([^/]+?)(?:\.git)?/?",
@@ -93,10 +100,11 @@ def _prepare_repository(repo_url: str, thread_id: str, token: str | None = None)
         )
 
     except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.strip() or exc.stdout.strip()
-        if token:
-            detail = detail.replace(token, "***")
-        raise ValueError(f"Unable to clone GitHub repository: {detail}") from exc
+        # Do not return raw Git stderr to the API client; it may contain private
+        # repository details or credential-bearing URLs from external tooling.
+        raise ValueError(
+            "Unable to clone GitHub repository. Verify the URL and repository access."
+        ) from exc
 
     except subprocess.TimeoutExpired as exc:
         raise ValueError(

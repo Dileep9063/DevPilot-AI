@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -5,6 +7,10 @@ from rest_framework.response import Response
 from .ai_service import ask_gemini
 from . import agent_service, github_app
 from .models import AgentRun, GitHubInstallation
+
+logger = logging.getLogger(__name__)
+MAX_TASK_LENGTH = 4000
+MAX_REPO_URL_LENGTH = 300
 
 
 @api_view(["GET"])
@@ -17,12 +23,15 @@ def status(request):
 @permission_classes([IsAuthenticated])
 def ai_chat(request):
     message = request.data.get("message")
-    if not message:
-        return Response({"error": "Message is required"}, status=400)
+    if not isinstance(message, str) or not message.strip():
+        return Response({"error": "message must be a non-empty string"}, status=400)
+    if len(message) > MAX_TASK_LENGTH:
+        return Response({"error": f"message must be at most {MAX_TASK_LENGTH} characters"}, status=400)
     try:
-        return Response({"response": ask_gemini(message)})
-    except Exception as e:
-        return Response({"error": str(e)}, status=500)
+        return Response({"response": ask_gemini(message.strip())})
+    except Exception:
+        logger.exception("AI chat provider failed")
+        return Response({"error": "The AI provider request failed. Please try again later."}, status=502)
 
 
 @api_view(["POST"])
@@ -30,10 +39,20 @@ def ai_chat(request):
 def agent_run(request):
     task = request.data.get("task")
     repo_url = request.data.get("repo_url")
-    if not task:
-        return Response({"error": "task is required"}, status=400)
-    if not repo_url:
-        return Response({"error": "repo_url is required"}, status=400)
+    if not isinstance(task, str) or not task.strip():
+        return Response({"error": "task must be a non-empty string"}, status=400)
+    if len(task) > MAX_TASK_LENGTH:
+        return Response({"error": f"task must be at most {MAX_TASK_LENGTH} characters"}, status=400)
+    if not isinstance(repo_url, str) or not repo_url.strip():
+        return Response({"error": "repo_url must be a non-empty string"}, status=400)
+    repo_url = repo_url.strip()
+    if len(repo_url) > MAX_REPO_URL_LENGTH:
+        return Response({"error": f"repo_url must be at most {MAX_REPO_URL_LENGTH} characters"}, status=400)
+    try:
+        # Validate before creating a database row or starting any Git operation.
+        agent_service._validate_github_url(repo_url)
+    except ValueError as exc:
+        return Response({"error": str(exc)}, status=400)
 
     supplied_thread_id = request.data.get("thread_id")
     thread_id = None
@@ -54,6 +73,20 @@ def agent_run(request):
                 request.user, owner, repo_name
             )
 
+        from django.conf import settings
+
+        if settings.DEVPILOT_ASYNC_RUNS:
+            from .tasks import run_agent_job
+
+            AgentRun.objects.filter(thread_id=thread_id).update(status="queued")
+            try:
+                run_agent_job.delay(thread_id, task, repo_url, installation_id)
+            except Exception:
+                logger.exception("Could not enqueue agent run (thread_id=%s)", thread_id)
+                agent_service.record_run_outcome(thread_id, error="The agent job could not be queued.")
+                return Response({"error": "The agent job could not be queued. Please retry."}, status=503)
+            return Response({"status": "queued", "thread_id": thread_id}, status=202)
+
         result = agent_service.run_agent_task(
             task, thread_id, repo_url, installation_id
         )
@@ -65,9 +98,10 @@ def agent_run(request):
     except ValueError as e:
         agent_service.record_run_outcome(thread_id, error=str(e))
         return Response({"error": str(e)}, status=400)
-    except Exception as e:
-        agent_service.record_run_outcome(thread_id, error=str(e))
-        return Response({"error": str(e)}, status=500)
+    except Exception:
+        logger.exception("Agent run failed (thread_id=%s)", thread_id or "unassigned")
+        agent_service.record_run_outcome(thread_id, error="Agent run failed. Check server logs for details.")
+        return Response({"error": "The agent run failed. Please check the run status and server logs."}, status=500)
 
     payload = agent_service.serialize_result(result)
     payload["thread_id"] = thread_id
@@ -88,14 +122,36 @@ def agent_resume(request):
 
     try:
         agent_service.validate_owned_thread(request.user, thread_id)
+        from django.conf import settings
+
+        if settings.DEVPILOT_ASYNC_RUNS:
+            from .tasks import resume_agent_job
+
+            claimed = AgentRun.objects.filter(
+                thread_id=thread_id, status="waiting_for_approval"
+            ).update(status="queued")
+            if not claimed:
+                return Response(
+                    {"error": "This run is not waiting for approval or has already been resumed."},
+                    status=409,
+                )
+            try:
+                resume_agent_job.delay(thread_id, decision)
+            except Exception:
+                logger.exception("Could not enqueue agent resume (thread_id=%s)", thread_id)
+                agent_service.record_run_outcome(thread_id, error="The resume job could not be queued.")
+                return Response({"error": "The resume job could not be queued. Please retry."}, status=503)
+            return Response({"status": "queued", "thread_id": thread_id}, status=202)
+
         result = agent_service.resume_agent_task(thread_id, decision)
     except agent_service.ThreadOwnershipError as e:
         return Response({"error": str(e)}, status=403)
     except ValueError as e:
         return Response({"error": str(e)}, status=400)
-    except Exception as e:
-        agent_service.record_run_outcome(thread_id, error=str(e))
-        return Response({"error": str(e)}, status=500)
+    except Exception:
+        logger.exception("Agent resume failed (thread_id=%s)", thread_id)
+        agent_service.record_run_outcome(thread_id, error="Agent resume failed. Check server logs for details.")
+        return Response({"error": "The agent could not resume this run. Please check the run status and server logs."}, status=500)
 
     payload = agent_service.serialize_result(result)
     payload["thread_id"] = thread_id

@@ -21,7 +21,7 @@ for that checklist.
 import uuid
 
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END
@@ -269,6 +269,32 @@ class AgentApiValidationTests(TestCase):
             response.status_code,
             400,
         )
+    def test_agent_run_rejects_non_string_task(self):
+        response = self.client.post(
+            "/api/agent/run/",
+            {"task": ["unexpected"], "repo_url": "https://github.com/owner/repo"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_agent_run_rejects_oversized_task(self):
+        response = self.client.post(
+            "/api/agent/run/",
+            {"task": "x" * 4001, "repo_url": "https://github.com/owner/repo"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_agent_run_rejects_non_github_url_before_creating_run(self):
+        before = AgentRun.objects.count()
+        response = self.client.post(
+            "/api/agent/run/",
+            {"task": "test", "repo_url": "https://example.com/owner/repo"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(AgentRun.objects.count(), before)
+
     def test_agent_run_requires_authentication(self):
         self.client.force_authenticate(user=None)
 
@@ -1352,3 +1378,22 @@ class GitHubConnectApiTests(GitHubAppTestBase):
 
         self.assertEqual(res.status_code, 200)
         self.assertEqual(run.call_args.args[3], 0)
+
+    def test_async_run_is_queued_without_blocking_for_agent(self):
+        from unittest import mock
+        from core import agent_service
+
+        self.configure_app(enabled=False)
+        self.client.force_authenticate(user=self.user)
+
+        with override_settings(DEVPILOT_ASYNC_RUNS=True), mock.patch("core.tasks.run_agent_job.delay") as enqueue:
+            response = self.client.post(
+                "/api/agent/run/",
+                {"task": "Add a test", "repo_url": "https://github.com/o/r"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["status"], "queued")
+        self.assertEqual(AgentRun.objects.get(thread_id=response.data["thread_id"]).status, "queued")
+        enqueue.assert_called_once()

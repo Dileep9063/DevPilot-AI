@@ -1,0 +1,7 @@
+[
+  {"query":"LLM provider fallback retry","expected_path_substrings":["llm_providers.py"]},
+  {"query":"test subprocess timeout workspace output","expected_path_substrings":["tools.py","test_tool_output.py"]},
+  {"query":"agent run approval checkpoint","expected_path_substrings":["agent_service.py","agent.py"]},
+  {"query":"authentication endpoint ownership","expected_path_substrings":["views.py"]},
+  {"query":"database AgentRun model","expected_path_substrings":["models.py"]}
+]

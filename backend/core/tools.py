@@ -5,6 +5,7 @@ from langchain_core.tools import tool
 import os
 import subprocess
 import sys
+import time
 import base64
 import re
 import requests
@@ -130,20 +131,34 @@ PROTECTED_BRANCHES = {"main", "master"}
 _SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "URI", "DATABASE_URL")
 
 
-def _sanitized_env():
+def _sanitized_env(workspace=None):
     """
-    Environment for running a cloned repository's tests.
+    Reduced environment for repository tests.
 
-    Strips anything that looks like a secret (API keys, GITHUB_TOKEN,
-    DB URIs) so untrusted repo code cannot read DevPilot's credentials.
+    This is defense in depth, not a sandbox: untrusted code can still access
+    files and resources available to the process. Run untrusted repos only in
+    a separately isolated execution environment.
     """
+    blocked_names = {
+        "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_ASKPASS", "SSH_ASKPASS",
+        "DOCKER_HOST", "DOCKER_CONFIG", "KUBECONFIG", "GPG_AGENT_INFO",
+    }
     env = {
         k: v
         for k, v in os.environ.items()
-        if not any(m in k.upper() for m in _SECRET_MARKERS)
+        if k.upper() not in blocked_names
+        and not any(m in k.upper() for m in _SECRET_MARKERS)
     }
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["CI"] = "true"  # keep npm test runners out of watch mode
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    if workspace is not None:
+        isolated_home = Path(workspace) / ".devpilot-home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(isolated_home)
+        env["XDG_CONFIG_HOME"] = str(isolated_home / ".config")
+        env["XDG_CACHE_HOME"] = str(isolated_home / ".cache")
     return env
 
 
@@ -205,14 +220,20 @@ def _record_written(path):
 def _stage_changes(workspace):
     written = _read_written(workspace)
 
+    # Clear any pre-existing index entries first. Repository tests/build hooks
+    # may run `git add`; never let those staged files sneak into an agent commit.
+    # `git reset` needs HEAD, so use rm --cached for an unborn repository.
+    try:
+        _git(["rev-parse", "--verify", "HEAD"], workspace)
+    except subprocess.CalledProcessError:
+        _git(["rm", "--cached", "-r", "-f", "--ignore-unmatch", "."], workspace)
+    else:
+        _git(["reset", "--quiet"], workspace)
     if written:
         _git(["add", "--", *written], workspace)
-    else:
-        # No record: stage everything except build output.
-        _git(
-            ["add", "-A", "--", ".", *[f":(exclude){d}" for d in BUILD_DIRS]],
-            workspace,
-        )
+    # Fail closed: never stage arbitrary repository changes when the agent
+    # has not recorded an approved write. This prevents tests, build tools,
+    # or pre-existing user changes from being committed accidentally.
 
 
 
@@ -1485,6 +1506,233 @@ def write_new_file(
 # RUN TESTS
 # ============================================================
 
+_MAX_TEST_OUTPUT_CHARS = 20000
+
+
+def _build_test_command(command, workspace, mode=None):
+    """Build the requested test command, optionally inside bubblewrap.
+
+    bubblewrap mode mounts only system runtime paths and the active workspace,
+    drops the inherited environment, and disables network access. If the
+    sandbox prerequisites are missing, fail closed rather than falling back.
+    """
+    import shutil
+
+    mode = (mode or os.environ.get("DEVPILOT_TEST_SANDBOX", "unsafe-local")).lower()
+    if mode == "unsafe-local":
+        return list(command)
+    if mode != "bubblewrap":
+        raise ValueError(
+            "Test execution is disabled. Set DEVPILOT_TEST_SANDBOX=bubblewrap "
+            "or explicitly choose unsafe-local for trusted local development."
+        )
+
+    bwrap = shutil.which("bwrap")
+    prlimit = shutil.which("prlimit")
+    if not bwrap or not prlimit:
+        raise FileNotFoundError(
+            "Sandbox prerequisites are missing (bubblewrap and prlimit). "
+            "Refusing to execute repository tests without isolation."
+        )
+
+    workspace = Path(workspace).resolve()
+    sandbox_workspace = "/tmp/workspace"
+    args = [
+        prlimit,
+        "--cpu=120:120",
+        "--as=6442450944:6442450944",
+        "--fsize=104857600:104857600",
+        "--nofile=256:256",
+        "--nproc=128:128",
+        "--",
+        bwrap,
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+    ]
+    # Mount the runtime read-only; the app process runs as an unprivileged user.
+    for system_path in ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/app", "/opt"):
+        if Path(system_path).exists():
+            args.extend(["--ro-bind", system_path, system_path])
+
+    args.extend([
+        "--tmpfs", "/tmp",
+        "--dir", sandbox_workspace,
+        "--bind", str(workspace), sandbox_workspace,
+    ])
+    # Hide other runs and common per-user/runtime write locations. The active
+    # workspace is already bind-mounted elsewhere before /data is hidden.
+    for hidden_path in ("/data", "/home", "/root", "/run", "/var/tmp", "/mnt", "/media", "/srv"):
+        if Path(hidden_path).exists():
+            args.extend(["--tmpfs", hidden_path])
+
+    args.extend([
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--chdir", sandbox_workspace,
+        "--clearenv",
+        "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
+        "--setenv", "HOME", sandbox_workspace + "/.devpilot-home",
+        "--setenv", "XDG_CACHE_HOME", sandbox_workspace + "/.devpilot-home/.cache",
+        "--setenv", "CI", "true",
+        "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+        "--",
+        *command,
+    ])
+    return args
+
+
+_MAX_CAPTURE_BYTES = 80000
+
+
+def _run_bounded_subprocess(
+    command,
+    cwd,
+    env,
+    timeout=120,
+    max_output_bytes=_MAX_CAPTURE_BYTES,
+    max_workspace_bytes=None,
+    max_workspace_files=None,
+):
+    """Run a command with bounded output and best-effort workspace growth limits.
+
+    Workspace limits are monitored periodically and are not a kernel-enforced
+    disk quota. Per-file limits in bubblewrap mode provide an additional guard.
+    """
+    import signal
+    import threading
+
+    max_workspace_bytes = max_workspace_bytes or int(
+        os.environ.get("DEVPILOT_TEST_MAX_WORKSPACE_BYTES", 500 * 1024 * 1024)
+    )
+    max_workspace_files = max_workspace_files or int(
+        os.environ.get("DEVPILOT_TEST_MAX_WORKSPACE_FILES", 50000)
+    )
+
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=(os.name != "nt"),
+    )
+    buffers = {"stdout": [], "stderr": []}
+    counts = {"stdout": 0, "stderr": 0}
+    truncated = {"stdout": False, "stderr": False}
+
+    def drain(name, pipe):
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                break
+            remaining = max_output_bytes - counts[name]
+            if remaining > 0:
+                kept = chunk[:remaining]
+                buffers[name].append(kept)
+                counts[name] += len(kept)
+            if len(chunk) > max(remaining, 0):
+                truncated[name] = True
+
+    readers = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    timed_out = False
+    workspace_limit_exceeded = threading.Event()
+    workspace_root = Path(cwd).resolve()
+
+    def monitor_workspace():
+        while process.poll() is None:
+            total_bytes = 0
+            total_files = 0
+            try:
+                for root, dirs, files in os.walk(workspace_root, followlinks=False):
+                    dirs[:] = [
+                        name for name in dirs
+                        if not (Path(root) / name).is_symlink()
+                    ]
+                    for name in files:
+                        path = Path(root) / name
+                        try:
+                            if path.is_symlink():
+                                continue
+                            stat_result = path.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if not path.is_file():
+                            continue
+                        total_files += 1
+                        total_bytes += stat_result.st_size
+                        if total_bytes > max_workspace_bytes or total_files > max_workspace_files:
+                            workspace_limit_exceeded.set()
+                            try:
+                                if os.name != "nt":
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                else:
+                                    process.kill()
+                            except ProcessLookupError:
+                                pass
+                            return
+            except OSError:
+                pass
+            time.sleep(0.5)
+
+    monitor = threading.Thread(target=monitor_workspace, daemon=True)
+    monitor.start()
+    try:
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        return_code = process.wait()
+    monitor.join(timeout=1)
+
+    for reader in readers:
+        reader.join(timeout=2)
+    for pipe in (process.stdout, process.stderr):
+        if pipe:
+            pipe.close()
+
+    def output(name):
+        value = b"".join(buffers[name]).decode("utf-8", errors="replace")
+        if truncated[name]:
+            value += "\n...[capture truncated]"
+        return value
+
+    stdout, stderr = output("stdout"), output("stderr")
+    if workspace_limit_exceeded.is_set():
+        raise RuntimeError(
+            "Repository test stopped because workspace output exceeded the configured "
+            "file-count or disk-usage limit."
+        )
+    if timed_out:
+        raise subprocess.TimeoutExpired(
+            command, timeout, output=stdout, stderr=stderr
+        )
+    return subprocess.CompletedProcess(command, return_code, stdout, stderr)
+
+
+def _bounded_output(value):
+    """Decode and cap command output before storing it in agent state."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    value = str(value)
+    if len(value) <= _MAX_TEST_OUTPUT_CHARS:
+        return value
+    omitted = len(value) - _MAX_TEST_OUTPUT_CHARS
+    return value[:_MAX_TEST_OUTPUT_CHARS] + f"\n...[truncated {omitted} characters]"
 @tool
 def run_tests():
     """
@@ -1596,13 +1844,17 @@ def run_tests():
         # Execute
         # ----------------------------------------------------
 
-        result = subprocess.run(
-            command,
+        execution_command = _build_test_command(command, workspace)
+        if os.environ.get("DEVPILOT_TEST_SANDBOX", "unsafe-local").lower() == "unsafe-local":
+            import logging
+            logging.getLogger(__name__).warning(
+                "Running repository tests without a sandbox; use bubblewrap mode for untrusted code."
+            )
+        result = _run_bounded_subprocess(
+            execution_command,
             cwd=workspace,
-            capture_output=True,
-            text=True,
+            env=_sanitized_env(workspace),
             timeout=120,
-            env=_sanitized_env(),
         )
 
         return {
@@ -1617,21 +1869,17 @@ def run_tests():
             "command":
                 command,
 
-            "stdout":
-                result.stdout,
+            "stdout": _bounded_output(result.stdout),
 
-            "stderr":
-                result.stderr,
+            "stderr": _bounded_output(result.stderr),
         }
 
-    except subprocess.TimeoutExpired:
-
+    except subprocess.TimeoutExpired as exc:
         return {
-            "status":
-                "error",
-
-            "message":
-                "Test/build execution timed out after 120 seconds.",
+            "status": "error",
+            "message": "Test/build execution timed out after 120 seconds.",
+            "stdout": _bounded_output(exc.stdout),
+            "stderr": _bounded_output(exc.stderr),
         }
 
     except FileNotFoundError as e:
