@@ -21,7 +21,8 @@ class BackgroundTaskTests(TestCase):
             status="queued",
         )
 
-    def test_worker_claims_queued_run_and_records_result(self):
+    @mock.patch("core.tasks.close_old_connections")
+    def test_worker_claims_queued_run_and_records_result(self, _close_connections):
         with mock.patch(
             "core.agent_service.run_agent_task",
             return_value={"final_result": "ok"},
@@ -45,7 +46,8 @@ class BackgroundTaskTests(TestCase):
         # The mocked persistence layer does not update status; claiming the job does.
         self.assertEqual(self.run.status, "running")
 
-    def test_worker_skips_duplicate_delivery(self):
+    @mock.patch("core.tasks.close_old_connections")
+    def test_worker_skips_duplicate_delivery(self, _close_connections):
         self.run.status = "running"
         self.run.save(update_fields=["status"])
 
