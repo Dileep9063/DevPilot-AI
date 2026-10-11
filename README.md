@@ -296,3 +296,22 @@ container, albeit with a reduced environment and an unprivileged container user.
 untrusted repositories in a public multi-user deployment until a separate execution sandbox
 with strict resource, filesystem, privilege, and network controls has been implemented and
 tested.
+
+
+## Repository test execution safety
+
+The Docker Compose backend and worker select `DEVPILOT_TEST_SANDBOX=bubblewrap`. In that mode, test/build commands run with network and other namespaces unshared, a read-only container filesystem, only the current run's workspace writable, a cleared child environment, and CPU/address-space/file-size/process/file-descriptor limits. If Bubblewrap or `prlimit` is unavailable, execution fails closed; it never silently falls back to an unsandboxed command. The sandbox is defense in depth, not a guarantee against every kernel/container escape, and disk-usage quotas are not currently enforced. Do not expose arbitrary-code execution publicly without further security review and adversarial testing.
+
+For trusted local development outside Docker Compose, set `DEVPILOT_TEST_SANDBOX=unsafe-local` explicitly. This executes commands without OS sandbox isolation and must not be used for untrusted repositories.
+
+## LLM usage and search benchmark
+
+Successful LLM calls log provider, model, latency, available input/output token counts, and an estimated USD cost. Configure `LLM_COST_<PROVIDER>_INPUT_PER_1M` and `LLM_COST_<PROVIDER>_OUTPUT_PER_1M` using the provider's current pricing. Zero is the default, so cost remains an estimate and is not a persisted billing ledger; calls without token metadata are logged as unknown.
+
+Run a baseline for the current BM25-style keyword search from the repository root:
+
+```bash
+python backend/scripts/benchmark_code_search.py ./path/to/repository --repeats 5
+```
+
+Save baseline results before changing retrieval. The script reports latency and top paths; relevance still needs a manually labeled query set before comparing lexical search with hybrid/semantic retrieval.
