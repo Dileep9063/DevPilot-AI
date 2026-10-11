@@ -299,7 +299,7 @@ For trusted local development outside Docker Compose, set `DEVPILOT_TEST_SANDBOX
 
 ## LLM usage and search benchmark
 
-Successful LLM calls log provider, model, latency, available input/output token counts, and an estimated USD cost. Configure `LLM_COST_<PROVIDER>_INPUT_PER_1M` and `LLM_COST_<PROVIDER>_OUTPUT_PER_1M` using the provider's current pricing. Zero is the default, so cost remains an estimate and is not a persisted billing ledger; calls without token metadata are logged as unknown.
+Successful LLM calls log provider, model, latency, available input/output token counts, and an estimated USD cost. Configure `LLM_COST_<PROVIDER>_INPUT_PER_1M` and `LLM_COST_<PROVIDER>_OUTPUT_PER_1M` using the provider's current pricing. If rates are missing or token metadata is unavailable, cost is logged as unknown. This is an estimate, not a persisted billing ledger.
 
 Run a baseline for the current BM25-style keyword search from the repository root:
 
