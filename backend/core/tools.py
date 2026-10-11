@@ -1508,6 +1508,70 @@ def write_new_file(
 _MAX_TEST_OUTPUT_CHARS = 20000
 
 
+def _build_test_command(command, workspace, mode=None):
+    """Build the requested test command, optionally inside bubblewrap.
+
+    bubblewrap mode mounts only system runtime paths and the active workspace,
+    drops the inherited environment, and disables network access. If the
+    sandbox prerequisites are missing, fail closed rather than falling back.
+    """
+    import shutil
+
+    mode = (mode or os.environ.get("DEVPILOT_TEST_SANDBOX", "unsafe-local")).lower()
+    if mode == "unsafe-local":
+        return list(command)
+    if mode != "bubblewrap":
+        raise ValueError(
+            "Test execution is disabled. Set DEVPILOT_TEST_SANDBOX=bubblewrap "
+            "or explicitly choose unsafe-local for trusted local development."
+        )
+
+    bwrap = shutil.which("bwrap")
+    prlimit = shutil.which("prlimit")
+    if not bwrap or not prlimit:
+        raise FileNotFoundError(
+            "Sandbox prerequisites are missing (bubblewrap and prlimit). "
+            "Refusing to execute repository tests without isolation."
+        )
+
+    workspace = Path(workspace).resolve()
+    args = [
+        prlimit,
+        "--cpu=120:120",
+        "--as=2147483648:2147483648",
+        "--fsize=104857600:104857600",
+        "--nofile=256:256",
+        "--nproc=128:128",
+        "--",
+        bwrap,
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--ro-bind", "/usr", "/usr",
+    ]
+    for system_path in ("/etc", "/bin", "/lib", "/lib64"):
+        if Path(system_path).exists():
+            args.extend(["--ro-bind", system_path, system_path])
+
+    args.extend([
+        "--ro-bind", "/app", "/app",
+        "--bind", str(workspace), str(workspace),
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--chdir", str(workspace),
+        "--clearenv",
+        "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
+        "--setenv", "HOME", str(workspace / ".devpilot-home"),
+        "--setenv", "XDG_CACHE_HOME", str(workspace / ".devpilot-home" / ".cache"),
+        "--setenv", "CI", "true",
+        "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+        "--",
+        *command,
+    ])
+    return args
+
+
 def _bounded_output(value):
     """Decode and cap command output before storing it in agent state."""
     if value is None:
@@ -1630,8 +1694,14 @@ def run_tests():
         # Execute
         # ----------------------------------------------------
 
+        execution_command = _build_test_command(command, workspace)
+        if os.environ.get("DEVPILOT_TEST_SANDBOX", "unsafe-local").lower() == "unsafe-local":
+            import logging
+            logging.getLogger(__name__).warning(
+                "Running repository tests without a sandbox; use bubblewrap mode for untrusted code."
+            )
         result = subprocess.run(
-            command,
+            execution_command,
             cwd=workspace,
             capture_output=True,
             text=True,
