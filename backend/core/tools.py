@@ -68,7 +68,17 @@ def reset_github_token(ctx_token):
 
 
 def get_github_token():
-    return _github_token_context.get() or os.environ.get("GITHUB_TOKEN") or ""
+    # Per-user GitHub App tokens always win. Production Compose disables the
+    # shared fallback so one deployment token cannot write across user accounts.
+    scoped_token = _github_token_context.get()
+    if scoped_token:
+        return scoped_token
+    try:
+        from django.conf import settings
+        allow_shared = getattr(settings, "DEVPILOT_ALLOW_SHARED_GITHUB_TOKEN", True)
+    except Exception:
+        allow_shared = True  # standalone trusted local tools/tests
+    return (os.environ.get("GITHUB_TOKEN") or "") if allow_shared else ""
 
 
 def github_auth_args(token: str):
@@ -1537,6 +1547,12 @@ def _build_test_command(command, workspace, mode=None):
 
     workspace = Path(workspace).resolve()
     sandbox_workspace = "/tmp/workspace"
+    try:
+        tmpfs_bytes = int(os.environ.get("DEVPILOT_TEST_TMPFS_BYTES", 512 * 1024 * 1024))
+    except (TypeError, ValueError):
+        tmpfs_bytes = 512 * 1024 * 1024
+    # Clamp to a safe finite range so the sandbox's writable tmpfs is bounded.
+    tmpfs_bytes = max(64 * 1024 * 1024, min(tmpfs_bytes, 2 * 1024 * 1024 * 1024))
     args = [
         prlimit,
         "--cpu=120:120",
@@ -1556,7 +1572,7 @@ def _build_test_command(command, workspace, mode=None):
             args.extend(["--ro-bind", system_path, system_path])
 
     args.extend([
-        "--tmpfs", "/tmp",
+        "--size", str(tmpfs_bytes), "--tmpfs", "/tmp",
         "--dir", sandbox_workspace,
         "--bind", str(workspace), sandbox_workspace,
     ])
@@ -1564,7 +1580,7 @@ def _build_test_command(command, workspace, mode=None):
     # workspace is already bind-mounted elsewhere before /data is hidden.
     for hidden_path in ("/data", "/home", "/root", "/run", "/var/tmp", "/mnt", "/media", "/srv"):
         if Path(hidden_path).exists():
-            args.extend(["--tmpfs", hidden_path])
+            args.extend(["--size", str(tmpfs_bytes), "--tmpfs", hidden_path])
 
     args.extend([
         "--proc", "/proc",

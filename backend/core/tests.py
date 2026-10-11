@@ -1397,3 +1397,87 @@ class GitHubConnectApiTests(GitHubAppTestBase):
         self.assertEqual(response.data["status"], "queued")
         self.assertEqual(AgentRun.objects.get(thread_id=response.data["thread_id"]).status, "queued")
         enqueue.assert_called_once()
+
+class AgentWorkerReliabilityTests(TestCase):
+    """Regression tests for queue timestamps, stale-run recovery and isolation config."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="worker_reliability", password="Testuser@123"
+        )
+        self.thread_id = uuid.uuid4()
+        self.run = AgentRun.objects.create(
+            user=self.user,
+            thread_id=self.thread_id,
+            task="Reliability test",
+            repo_url="https://github.com/example/repo",
+            status="queued",
+        )
+
+    def test_claiming_queued_run_refreshes_updated_at(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from core.tasks import _claim_queued_run
+
+        old_time = timezone.now() - timedelta(hours=2)
+        AgentRun.objects.filter(pk=self.run.pk).update(updated_at=old_time)
+        self.assertTrue(_claim_queued_run(str(self.thread_id)))
+
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, "running")
+        self.assertGreater(self.run.updated_at, old_time)
+
+    def test_stale_recovery_marks_old_runs_but_preserves_recent_runs(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from core.tasks import recover_stale_agent_runs
+
+        stale_id = self.thread_id
+        fresh_id = uuid.uuid4()
+        AgentRun.objects.create(
+            user=self.user,
+            thread_id=fresh_id,
+            task="Still running",
+            repo_url="https://github.com/example/repo",
+            status="running",
+        )
+        old_time = timezone.now() - timedelta(hours=2)
+        AgentRun.objects.filter(thread_id=stale_id).update(status="running", updated_at=old_time)
+
+        # Worker tasks close/reopen DB connections in production. Keep that
+        # cleanup outside this TestCase's transaction-managed connection.
+        from unittest import mock
+        with mock.patch("core.tasks.close_old_connections"):
+            changed = recover_stale_agent_runs.run()
+        self.assertEqual(changed, 1)
+
+        self.run.refresh_from_db()
+        fresh = AgentRun.objects.get(thread_id=fresh_id)
+        self.assertEqual(self.run.status, "error")
+        self.assertIn("interrupted", self.run.summary.lower())
+        self.assertEqual(fresh.status, "running")
+
+    def test_bubblewrap_command_has_a_bounded_tmpfs(self):
+        from unittest import mock
+        from core.tools import _build_test_command
+
+        with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+            command = _build_test_command(
+                ["npm", "test"], ".", mode="bubblewrap"
+            )
+
+        self.assertIn("--size", command)
+        size_index = command.index("--size")
+        self.assertEqual(int(command[size_index + 1]), 512 * 1024 * 1024)
+
+    def test_production_can_disable_shared_github_token_fallback(self):
+        from unittest import mock
+        from django.test import override_settings
+        from core.tools import get_github_token
+
+        with mock.patch.dict("os.environ", {"GITHUB_TOKEN": "shared-test-token"}):
+            with override_settings(DEVPILOT_ALLOW_SHARED_GITHUB_TOKEN=False):
+                self.assertEqual(get_github_token(), "")
+            with override_settings(DEVPILOT_ALLOW_SHARED_GITHUB_TOKEN=True):
+                self.assertEqual(get_github_token(), "shared-test-token")
+

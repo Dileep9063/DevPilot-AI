@@ -35,6 +35,11 @@ services:
   backend:
     build: ./backend
     restart: unless-stopped
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
     env_file: .env
     environment:
       DJANGO_DEBUG: "False"
@@ -46,6 +51,8 @@ services:
       LANGGRAPH_POSTGRES_URI: postgresql://devpilot:${POSTGRES_PASSWORD}@db:5432/devpilot
       DEVPILOT_ASYNC_RUNS: "True"
       DEVPILOT_TEST_SANDBOX: bubblewrap
+      DEVPILOT_ALLOW_SHARED_GITHUB_TOKEN: "False"
+      DEVPILOT_TEST_TMPFS_BYTES: 536870912
       CELERY_BROKER_URL: redis://redis:6379/0
       DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
@@ -63,6 +70,11 @@ services:
   worker:
     build: ./backend
     restart: unless-stopped
+    mem_limit: 3g
+    cpus: 2.0
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
     env_file: .env
     environment:
       DJANGO_DEBUG: "False"
@@ -74,6 +86,8 @@ services:
       LANGGRAPH_POSTGRES_URI: postgresql://devpilot:${POSTGRES_PASSWORD}@db:5432/devpilot
       DEVPILOT_ASYNC_RUNS: "True"
       DEVPILOT_TEST_SANDBOX: bubblewrap
+      DEVPILOT_ALLOW_SHARED_GITHUB_TOKEN: "False"
+      DEVPILOT_TEST_TMPFS_BYTES: 536870912
       CELERY_BROKER_URL: redis://redis:6379/0
       DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}

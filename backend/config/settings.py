@@ -105,6 +105,8 @@ SIMPLE_JWT = {
 
 # Optional background execution settings.
 DEVPILOT_ASYNC_RUNS = os.getenv("DEVPILOT_ASYNC_RUNS", "False").lower() == "true"
+# Production should use per-user GitHub App tokens, not a deployment-wide write token.
+DEVPILOT_ALLOW_SHARED_GITHUB_TOKEN = os.getenv("DEVPILOT_ALLOW_SHARED_GITHUB_TOKEN", "True").lower() == "true"
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 CELERY_TASK_IGNORE_RESULT = True
 CELERY_TASK_TRACK_STARTED = True

@@ -191,11 +191,9 @@ All endpoints except register/login need `Authorization: Bearer <access>`.
 
 ## GitHub access: personal token or GitHub App
 
-- **Single token (default):** `GITHUB_TOKEN` in `.env`; you grant that token
-  access to each repository.
-- **GitHub App:** every user clicks **Connect GitHub** once and chooses which
-  repositories to share; DevPilot mints short-lived, per-repository tokens and
-  also works with private repositories. Setup (one-time registration):
+- **GitHub App (recommended for multi-user deployments):** each user clicks
+  **Connect GitHub** and chooses which repositories to share; DevPilot mints
+  short-lived, per-repository tokens. Setup:
   **[docs/GITHUB_APP_SETUP.md](docs/GITHUB_APP_SETUP.md)**.
 
 ## Testing
@@ -288,7 +286,7 @@ python manage.py test core
 pytest core/test_git_delivery.py core/test_llm_fallback.py core/test_background_tasks.py
 ```
 
-**Security limitation:** Bubblewrap isolation is defense in depth, not a guarantee against every kernel/container escape. Disk-usage quotas and adversarial sandbox escape testing remain outstanding. Do not expose arbitrary repository execution publicly until a security review and adversarial tests are complete.
+**Security limitation:** Bubblewrap and container resource caps are defense in depth, not a guarantee against every kernel/container escape. Workspace growth is monitored but not enforced by a kernel disk quota; adversarial sandbox escape testing remains outstanding. Do not expose arbitrary repository execution publicly until a security review and adversarial tests are complete.
 
 
 ## Repository test execution safety
