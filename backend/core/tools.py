@@ -1644,7 +1644,7 @@ def _run_bounded_subprocess(command, cwd, env, timeout=120, max_output_bytes=_MA
     def output(name):
         value = b"".join(buffers[name]).decode("utf-8", errors="replace")
         if truncated[name]:
-            value += "\\n...[capture truncated]"
+            value += "\n...[capture truncated]"
         return value
 
     stdout, stderr = output("stdout"), output("stderr")
