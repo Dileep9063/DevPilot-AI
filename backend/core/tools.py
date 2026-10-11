@@ -1565,7 +1565,6 @@ def _build_test_command(command, workspace, mode=None):
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
-        "--size", str(tmpfs_bytes),
     ]
     # Mount the runtime read-only; the app process runs as an unprivileged user.
     for system_path in ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/app", "/opt"):
@@ -1573,7 +1572,7 @@ def _build_test_command(command, workspace, mode=None):
             args.extend(["--ro-bind", system_path, system_path])
 
     args.extend([
-        "--tmpfs", "/tmp",
+        "--size", str(tmpfs_bytes), "--tmpfs", "/tmp",
         "--dir", sandbox_workspace,
         "--bind", str(workspace), sandbox_workspace,
     ])
@@ -1581,7 +1580,7 @@ def _build_test_command(command, workspace, mode=None):
     # workspace is already bind-mounted elsewhere before /data is hidden.
     for hidden_path in ("/data", "/home", "/root", "/run", "/var/tmp", "/mnt", "/media", "/srv"):
         if Path(hidden_path).exists():
-            args.extend(["--tmpfs", hidden_path])
+            args.extend(["--size", str(tmpfs_bytes), "--tmpfs", hidden_path])
 
     args.extend([
         "--proc", "/proc",
