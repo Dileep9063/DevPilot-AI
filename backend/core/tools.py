@@ -1539,7 +1539,7 @@ def _build_test_command(command, workspace, mode=None):
     args = [
         prlimit,
         "--cpu=120:120",
-        "--as=3221225472:3221225472",
+        "--as=6442450944:6442450944",
         "--fsize=104857600:104857600",
         "--nofile=256:256",
         "--nproc=128:128",
