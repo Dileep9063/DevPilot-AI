@@ -1444,7 +1444,11 @@ class AgentWorkerReliabilityTests(TestCase):
         old_time = timezone.now() - timedelta(hours=2)
         AgentRun.objects.filter(thread_id=stale_id).update(status="running", updated_at=old_time)
 
-        changed = recover_stale_agent_runs.run()
+        # Worker tasks close/reopen DB connections in production. Keep that
+        # cleanup outside this TestCase's transaction-managed connection.
+        from unittest import mock
+        with mock.patch("core.tasks.close_old_connections"):
+            changed = recover_stale_agent_runs.run()
         self.assertEqual(changed, 1)
 
         self.run.refresh_from_db()
