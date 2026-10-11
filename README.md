@@ -259,3 +259,40 @@ python manage.py cleanup_workspaces --days 7
   works. Streaming progress or a background worker would improve UX.
 - Retrieval is keyword-based; embeddings could be added for large repos.
 - No fork workflow: pushing requires write access to the target repository.
+
+
+## Security and background execution updates
+
+The security-hardening branch adds bounded API input validation, safer API error responses,
+GitHub URL validation, and fail-closed Git staging so only paths recorded by the agent are
+staged for commits. LLM provider retries are bounded and provider logs record provider,
+attempt, error type, and latency without printing raw exception messages.
+
+### Background runs in Docker Compose
+
+The Compose stack now includes Redis and a Celery worker. Compose enables
+`DEVPILOT_ASYNC_RUNS=True`; the API returns a run ID immediately and the React UI polls
+the persisted run status. The worker shares the workspace volume with the backend. Local
+development remains synchronous by default; set `DEVPILOT_ASYNC_RUNS=True` only when a
+Celery worker and broker are running.
+
+Start the stack with:
+
+```bash
+docker compose up -d --build
+docker compose logs -f backend worker
+```
+
+Run the offline test suites in the backend environment:
+
+```bash
+python manage.py test core
+pytest core/test_git_delivery.py core/test_llm_fallback.py core/test_background_tasks.py
+```
+
+**Security limitation:** These changes do not yet provide a hardened sandbox for arbitrary
+repository code. The current test runner still executes project commands inside the backend
+container, albeit with a reduced environment and an unprivileged container user. Do not run
+untrusted repositories in a public multi-user deployment until a separate execution sandbox
+with strict resource, filesystem, privilege, and network controls has been implemented and
+tested.
