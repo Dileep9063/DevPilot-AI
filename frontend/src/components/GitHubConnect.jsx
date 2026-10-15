@@ -38,12 +38,28 @@ export default function GitHubConnect() {
   }, []);
 
   const connect = async () => {
+    // Repository access updates do not trigger a redirect when GitHub App
+    // OAuth-on-install is enabled and no Setup URL can be configured.
+    // Keep DevPilot open in its current tab while the user edits access.
+    const updatingExistingConnection = Boolean(status?.connected);
+    const popup = updatingExistingConnection ? window.open("about:blank", "_blank") : null;
     setBusy(true);
     setError("");
     try {
       const { url } = await api.githubConnect();
-      window.location.assign(url);
+      if (updatingExistingConnection && popup) {
+        popup.opener = null;
+        popup.location.href = url;
+      } else {
+        if (updatingExistingConnection && !popup) {
+          setError("Your browser blocked the new tab. Allow pop-ups for DevPilot and try again.");
+          setBusy(false);
+          return;
+        }
+        window.location.assign(url);
+      }
     } catch (err) {
+      if (popup && !popup.closed) popup.close();
       setError(err.message);
       setBusy(false);
     }
@@ -95,9 +111,12 @@ export default function GitHubConnect() {
       <h2>
         GitHub connected <span className="badge completed">{accounts}</span>
       </h2>
+      <p className="muted">
+        Repository settings open in a new tab. When you finish changing access on GitHub, return to this tab to continue.
+      </p>
       {error && <p className="error">{error}</p>}
       <div className="actions">
-        <button onClick={connect} disabled={busy}>Add or change repositories</button>
+        <button onClick={connect} disabled={busy}>{busy ? "Opening GitHub…" : "Add or change repositories"}</button>
         <button className="link" onClick={disconnect} disabled={busy}>Disconnect</button>
       </div>
     </section>
