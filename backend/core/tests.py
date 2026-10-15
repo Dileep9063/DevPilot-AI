@@ -243,20 +243,31 @@ class AgentApiValidationTests(TestCase):
             400,
         )
 
-    def test_agent_run_rejects_thread_id_to_protect_existing_checkpoint(self):
+    def test_agent_run_rejects_reusing_owned_thread_to_protect_checkpoint(self):
+        existing_thread_id = uuid.uuid4()
+        existing_run = AgentRun.objects.create(
+            user=self.user,
+            thread_id=existing_thread_id,
+            task="existing task",
+            repo_url="https://github.com/owner/repo",
+        )
         before = AgentRun.objects.count()
+
         response = self.client.post(
             "/api/agent/run/",
             {
                 "task": "start a different task",
                 "repo_url": "https://github.com/owner/repo",
-                "thread_id": str(uuid.uuid4()),
+                "thread_id": str(existing_thread_id),
             },
             format="json",
         )
+
         self.assertEqual(response.status_code, 400)
         self.assertIn("Use /api/agent/resume/", response.data["error"])
         self.assertEqual(AgentRun.objects.count(), before)
+        existing_run.refresh_from_db()
+        self.assertEqual(existing_run.task, "existing task")
 
     def test_agent_resume_requires_thread_id(self):
         response = self.client.post(
