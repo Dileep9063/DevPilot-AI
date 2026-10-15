@@ -55,10 +55,20 @@ def agent_run(request):
     except ValueError as exc:
         return Response({"error": str(exc)}, status=400)
 
-    # Starting a run and resuming a checkpoint are separate operations.
-    # Reusing a thread here can overwrite an existing LangGraph checkpoint
-    # with a new task/repository while leaving its run record unchanged.
-    if request.data.get("thread_id"):
+    # If a thread_id is supplied, preserve the ownership/security contract
+    # before rejecting thread reuse. A caller must not learn that another
+    # user's run exists merely because this endpoint disallows thread reuse.
+    supplied_thread_id = request.data.get("thread_id")
+    if supplied_thread_id:
+        try:
+            agent_service.validate_owned_thread(request.user, supplied_thread_id)
+        except agent_service.ThreadOwnershipError as exc:
+            return Response({"error": str(exc)}, status=403)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=400)
+
+        # Starting a run and resuming a checkpoint are separate operations.
+        # Reusing an owned thread could overwrite its LangGraph checkpoint.
         return Response(
             {"error": "Do not pass thread_id to /api/agent/run/. Use /api/agent/resume/ to resume an existing run."},
             status=400,
