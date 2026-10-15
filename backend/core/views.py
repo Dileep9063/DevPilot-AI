@@ -55,14 +55,19 @@ def agent_run(request):
     except ValueError as exc:
         return Response({"error": str(exc)}, status=400)
 
-    supplied_thread_id = request.data.get("thread_id")
+    # Starting a run and resuming a checkpoint are separate operations.
+    # Reusing a thread here can overwrite an existing LangGraph checkpoint
+    # with a new task/repository while leaving its run record unchanged.
+    if request.data.get("thread_id"):
+        return Response(
+            {"error": "Do not pass thread_id to /api/agent/run/. Use /api/agent/resume/ to resume an existing run."},
+            status=400,
+        )
+
     thread_id = None
     try:
-        if supplied_thread_id:
-            thread_id = agent_service.validate_owned_thread(request.user, supplied_thread_id)
-        else:
-            thread_id = agent_service.new_thread_id()
-            agent_service.create_agent_run(request.user, thread_id, task, repo_url)
+        thread_id = agent_service.new_thread_id()
+        agent_service.create_agent_run(request.user, thread_id, task, repo_url)
 
         installation_id = 0
 
