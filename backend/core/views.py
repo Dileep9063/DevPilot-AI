@@ -246,6 +246,34 @@ def github_status(request):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
+def github_repositories(request):
+    """Repositories selected for the user's connected DevPilot App installations."""
+    if not github_app.is_configured():
+        return Response({"app_configured": False, "repositories": []})
+    repositories = {}
+    try:
+        for installation in GitHubInstallation.objects.filter(user=request.user):
+            for repo in github_app.installation_repositories(installation.installation_id):
+                full_name = repo.get("full_name")
+                if full_name:
+                    repositories[full_name.lower()] = {
+                        "full_name": full_name,
+                        "html_url": repo.get("html_url", ""),
+                        "clone_url": repo.get("clone_url", ""),
+                        "default_branch": repo.get("default_branch", ""),
+                        "private": bool(repo.get("private", False)),
+                    }
+    except Exception:
+        logger.exception("Could not list GitHub repositories for user_id=%s", request.user.id)
+        return Response({"error": "Could not load GitHub repositories. Check the App installation permissions and try again."}, status=502)
+    return Response({
+        "app_configured": True,
+        "repositories": sorted(repositories.values(), key=lambda item: item["full_name"].lower()),
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def github_connect(request):
     """URL that sends the user to GitHub to install / configure the App."""
     if not github_app.is_configured():
