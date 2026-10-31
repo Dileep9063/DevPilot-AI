@@ -56,7 +56,10 @@ def run_agent_job(thread_id, task, repo_url, installation_id=0):
         from core import agent_service
         with _run_heartbeat(thread_id):
             result = agent_service.run_agent_task(task, thread_id, repo_url, int(installation_id or 0))
-        agent_service.record_run_outcome(thread_id, agent_service.serialize_result(result))
+        payload = agent_service.serialize_result(result)
+        agent_service.record_run_outcome(thread_id, payload)
+        if payload.get("status") == "completed" and payload.get("pr_url"):
+            agent_service.cleanup_completed_workspace(thread_id)
     except Exception:
         logger.exception("Background agent run failed: thread_id=%s", thread_id)
         from core import agent_service
@@ -75,7 +78,10 @@ def resume_agent_job(thread_id, decision, installation_id=0):
         from core import agent_service
         with _run_heartbeat(thread_id):
             result = agent_service.resume_agent_task(thread_id, decision, int(installation_id or 0))
-        agent_service.record_run_outcome(thread_id, agent_service.serialize_result(result))
+        payload = agent_service.serialize_result(result)
+        agent_service.record_run_outcome(thread_id, payload)
+        if payload.get("status") == "completed" and payload.get("pr_url"):
+            agent_service.cleanup_completed_workspace(thread_id)
     except Exception:
         logger.exception("Background agent resume failed: thread_id=%s", thread_id)
         from core import agent_service
