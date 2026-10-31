@@ -122,6 +122,8 @@ def agent_run(request):
     payload = agent_service.serialize_result(result)
     payload["thread_id"] = thread_id
     agent_service.record_run_outcome(thread_id, payload)
+    if payload.get("status") == "completed" and payload.get("pr_url"):
+        agent_service.cleanup_completed_workspace(thread_id)
     return Response(payload)
 
 
@@ -177,6 +179,8 @@ def agent_resume(request):
     payload = agent_service.serialize_result(result)
     payload["thread_id"] = thread_id
     agent_service.record_run_outcome(thread_id, payload)
+    if payload.get("status") == "completed" and payload.get("pr_url"):
+        agent_service.cleanup_completed_workspace(thread_id)
     return Response(payload)
 
 
