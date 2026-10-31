@@ -155,6 +155,28 @@ def user_installations(user_token: str) -> list:
     return resp.json().get("installations", [])
 
 
+
+def installation_repositories(installation_id: int) -> list:
+    """List repositories currently accessible to one connected installation."""
+    token = installation_token(installation_id)
+    repositories = []
+    page = 1
+    while True:
+        resp = requests.get(
+            f"{API}/installation/repositories",
+            headers={**_HEADERS, "Authorization": f"Bearer {token}"},
+            params={"per_page": 100, "page": page},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json().get("repositories", [])
+        repositories.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return repositories
+
+
 def find_repo_installation(owner: str, repo: str):
     """Installation id that covers owner/repo, or None if the App isn't installed there."""
     resp = requests.get(
