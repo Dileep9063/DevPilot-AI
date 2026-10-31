@@ -1,4 +1,5 @@
 import re
+import shutil
 import subprocess
 import uuid
 
@@ -147,6 +148,33 @@ def record_run_outcome(thread_id: str, payload: dict | None = None, error: str =
             run.summary = text[:2000]
 
     run.save()
+
+
+
+def cleanup_completed_workspace(thread_id: str) -> bool:
+    """Delete only this run's isolated clone after a successful PR is recorded."""
+    from core.models import AgentRun
+
+    try:
+        run = AgentRun.objects.get(thread_id=uuid.UUID(str(thread_id)))
+    except (AgentRun.DoesNotExist, ValueError, TypeError, AttributeError):
+        return False
+
+    if run.status != "completed" or not run.pr_url:
+        return False
+
+    runs_root = (WORKSPACE_ROOT / "runs").resolve()
+    run_workspace = _workspace_for_thread(thread_id)
+
+    # Only remove a real run directory directly under runs/; never follow symlinks.
+    if run_workspace.is_symlink():
+        return False
+    resolved = run_workspace.resolve()
+    if resolved.parent != runs_root or resolved == runs_root:
+        return False
+    if resolved.exists():
+        shutil.rmtree(resolved)
+    return True
 
 
 def get_pending_approval(thread_id: str):
