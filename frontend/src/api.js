@@ -74,6 +74,7 @@ export const api = {
   resume: (thread_id, decision) =>
     post("/api/agent/resume/", { thread_id, decision }),
   githubStatus: () => get("/api/github/status/"),
+  githubRepos: () => get("/api/github/repositories/"),
   githubConnect: () => get("/api/github/connect/"),
   githubDisconnect: () => post("/api/github/disconnect/", {}),
   runs: () => get("/api/agent/runs/"),
