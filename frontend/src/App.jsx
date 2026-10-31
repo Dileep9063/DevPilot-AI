@@ -10,6 +10,10 @@ import GitHubConnect from "./components/GitHubConnect";
 export default function App() {
   const [authed, setAuthed] = useState(() => !!tokens.access());
   const [repoUrl, setRepoUrl] = useState("");
+  const [repoOptions, setRepoOptions] = useState([]);
+  const [githubAppMode, setGithubAppMode] = useState(false);
+  const [reposLoading, setReposLoading] = useState(false);
+  const [repoLoadError, setRepoLoadError] = useState("");
   const [task, setTask] = useState("");
   const [threadId, setThreadId] = useState("");
   const [approval, setApproval] = useState(null); // pending approval_request
@@ -25,6 +29,43 @@ export default function App() {
       /* history is non-critical; ignore */
     }
   }, []);
+
+  // Load repositories already selected in the GitHub App installation.
+  // Selecting one here supplies its clone URL; users do not paste it again.
+  useEffect(() => {
+    if (!authed) return undefined;
+    let cancelled = false;
+    const loadRepositories = async () => {
+      try {
+        const status = await api.githubStatus();
+        if (cancelled) return;
+        const appMode = Boolean(status.app_configured);
+        setGithubAppMode(appMode);
+        if (!appMode || !status.connected) {
+          setRepoOptions([]);
+          setRepoUrl("");
+          return;
+        }
+        setReposLoading(true);
+        setRepoLoadError("");
+        const data = await api.githubRepos();
+        if (cancelled) return;
+        const options = data.repositories || [];
+        setRepoOptions(options);
+        setRepoUrl((current) =>
+          options.some((item) => item.clone_url === current)
+            ? current
+            : (options[0]?.clone_url || "")
+        );
+      } catch (err) {
+        if (!cancelled) setRepoLoadError(err.message);
+      } finally {
+        if (!cancelled) setReposLoading(false);
+      }
+    };
+    loadRepositories();
+    return () => { cancelled = true; };
+  }, [authed]);
 
   // Poll persisted run state while a background worker processes the task.
   useEffect(() => {
@@ -157,13 +198,38 @@ export default function App() {
 
       <form className="card" onSubmit={run}>
         <h2>New task</h2>
-        <input
-          value={repoUrl}
-          onChange={(e) => setRepoUrl(e.target.value)}
-          placeholder="https://github.com/owner/repository"
-          disabled={busy || waiting}
-          required
-        />
+        {githubAppMode ? (
+          <>
+            <label htmlFor="repository-select">GitHub repository</label>
+            <select
+              id="repository-select"
+              value={repoUrl}
+              onChange={(e) => setRepoUrl(e.target.value)}
+              disabled={busy || waiting || reposLoading || repoOptions.length === 0}
+              required
+            >
+              {repoOptions.length === 0 && <option value="">No repositories available</option>}
+              {repoOptions.map((repo) => (
+                <option key={repo.full_name} value={repo.clone_url}>
+                  {repo.full_name}{repo.private ? " (private)" : ""}
+                </option>
+              ))}
+            </select>
+            {reposLoading && <p className="muted">Loading your GitHub repositories…</p>}
+            {repoLoadError && <p className="error">{repoLoadError}</p>}
+            {!reposLoading && !repoLoadError && repoOptions.length === 0 && (
+              <p className="muted">No repositories are available. Use “Add or change repositories” above to grant DevPilot access.</p>
+            )}
+          </>
+        ) : (
+          <input
+            value={repoUrl}
+            onChange={(e) => setRepoUrl(e.target.value)}
+            placeholder="https://github.com/owner/repository"
+            disabled={busy || waiting}
+            required
+          />
+        )}
         <textarea
           value={task}
           onChange={(e) => setTask(e.target.value)}
